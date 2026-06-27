@@ -426,7 +426,7 @@ function Produtos() {
             <Field label="Temporada"><Input value={form.temporada || ""} onChange={e => setForm({ ...form, temporada: e.target.value })} /></Field>
             <Field label="Categoria"><Select value={form.categoria || "Torcedor"} onChange={e => setForm({ ...form, categoria: e.target.value })} options={["Torcedor", "Jogador", "Retrô", "Polo", "Treino"]} /></Field>
             <Field label="Cor"><Input value={form.cor || ""} onChange={e => setForm({ ...form, cor: e.target.value })} /></Field>
-            <Field label="Tamanho"><Select value={form.tamanho || "M"} onChange={e => setForm({ ...form, tamanho: e.target.value })} options={["PP", "P", "M", "G", "GG", "XG", "G4"]} /></Field>
+            <Field label="Tamanho"><Select value={form.tamanho || "M"} onChange={e => setForm({ ...form, tamanho: e.target.value })} options={["PP", "P", "M", "G", "GG", "2GG", "3GG", "4GG"]} /></Field>
             <Field label="Quantidade"><Input type="number" value={form.quantidade} onChange={e => setForm({ ...form, quantidade: e.target.value })} /></Field>
             <Field label="Custo (R$)"><Input type="number" value={form.custo} onChange={e => setForm({ ...form, custo: e.target.value })} /></Field>
             <Field label="Preço de Venda (R$)"><Input type="number" value={form.preco} onChange={e => setForm({ ...form, preco: e.target.value })} /></Field>
@@ -519,7 +519,7 @@ function Vendas() {
             <datalist id="produtos-list">{produtos.map(p => <option key={p.id} value={p.nome} />)}</datalist>
           </Field>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
-            <Field label="Tamanho"><Select value={form.tamanho} onChange={e => setForm({ ...form, tamanho: e.target.value })} options={["PP", "P", "M", "G", "GG", "XG", "G4"]} /></Field>
+            <Field label="Tamanho"><Select value={form.tamanho} onChange={e => setForm({ ...form, tamanho: e.target.value })} options={["PP", "P", "M", "G", "GG", "2GG", "3GG", "4GG"]} /></Field>
             <Field label="Qtd"><Input type="number" value={form.quantidade} onChange={e => setForm({ ...form, quantidade: e.target.value })} /></Field>
             <Field label="Valor (R$)"><Input type="number" value={form.valor} onChange={e => setForm({ ...form, valor: e.target.value })} /></Field>
           </div>
@@ -726,7 +726,7 @@ function Pedidos() {
           <Field label="Cliente"><Input value={form.cliente} onChange={e => setForm({ ...form, cliente: e.target.value })} /></Field>
           <Field label="Produto"><Input value={form.produto} onChange={e => setForm({ ...form, produto: e.target.value })} /></Field>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
-            <Field label="Tamanho"><Select value={form.tamanho} onChange={e => setForm({ ...form, tamanho: e.target.value })} options={["PP", "P", "M", "G", "GG", "XG", "G4"]} /></Field>
+            <Field label="Tamanho"><Select value={form.tamanho} onChange={e => setForm({ ...form, tamanho: e.target.value })} options={["PP", "P", "M", "G", "GG", "2GG", "3GG", "4GG"]} /></Field>
             <Field label="Qtd"><Input type="number" value={form.quantidade} onChange={e => setForm({ ...form, quantidade: e.target.value })} /></Field>
             <Field label="Valor (R$)"><Input type="number" value={form.valor} onChange={e => setForm({ ...form, valor: e.target.value })} /></Field>
           </div>
