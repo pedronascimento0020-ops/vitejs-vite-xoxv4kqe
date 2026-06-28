@@ -450,59 +450,139 @@ function Produtos() {
 // ============================================================
 // MÓDULO: VENDAS
 // ============================================================
+const SINC_KEY = "vibra_vendas_sinc_v1";
+const getSincronizadas = () => new Set(JSON.parse(localStorage.getItem(SINC_KEY) || "[]"));
+const marcarSincronizada = (id) => {
+  const s = getSincronizadas(); s.add(String(id));
+  localStorage.setItem(SINC_KEY, JSON.stringify([...s]));
+};
+
+const isVendaCancelada = (v) => v.status === "Cancelada" || String(v.obs || "").startsWith("[CANCELADA");
+
 function Vendas() {
-  const { rows, loading, add } = useTable("vendas");
+  const { rows, loading, add, edit } = useTable("vendas");
   const { rows: produtos, reload: reloadProdutos } = useTable("produtos", "nome.asc");
   const { rows: clientes } = useTable("clientes", "nome.asc");
   const [modal, setModal] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [erro, setErro] = useState(null);
+  const [modalCancelar, setModalCancelar] = useState(null);
+  const [modalSinc, setModalSinc] = useState(false);
+  const [sincLog, setSincLog] = useState(null);
   const empty = { cliente_nome: "", produto_nome: "", tamanho: "", quantidade: 1, valor: "", custo: "", desconto: 0, frete: 0, forma_pagamento: "PIX", data: today(), obs: "" };
   const [form, setForm] = useState(empty);
 
-  const fat = rows.reduce((a, v) => a + Number(v.valor || 0), 0);
-  const lucro = rows.reduce((a, v) => a + Number(v.lucro || 0), 0);
-  const ticket = rows.length > 0 ? fat / rows.length : 0;
+  // Separa canceladas dos KPIs
+  const vendasAtivas = rows.filter(v => !isVendaCancelada(v));
+  const fat = vendasAtivas.reduce((a, v) => a + Number(v.valor || 0), 0);
+  const lucro = vendasAtivas.reduce((a, v) => a + Number(v.lucro || 0), 0);
+  const ticket = vendasAtivas.length > 0 ? fat / vendasAtivas.length : 0;
   const margem = fat > 0 ? (lucro / fat) * 100 : 0;
 
-  // Produtos únicos (sem duplicar por tamanho)
-  const nomesUnicos = [...new Set(produtos.map(p => p.nome))].sort();
+  // Vendas antigas ainda não rastreadas pelo sistema (potencialmente sem baixa no estoque)
+  const naoSincronizadas = rows.filter(v => !isVendaCancelada(v) && !getSincronizadas().has(String(v.id)));
 
-  // Tamanhos disponíveis em estoque para o produto selecionado
+  const nomesUnicos = [...new Set(produtos.map(p => p.nome))].sort();
   const tamanhosDisponiveis = form.produto_nome
     ? produtos.filter(p => p.nome === form.produto_nome && Number(p.quantidade) > 0).map(p => p.tamanho)
     : [];
-
-  // Produto específico (nome + tamanho) selecionado
   const produtoEscolhido = produtos.find(p => p.nome === form.produto_nome && p.tamanho === form.tamanho);
 
   const selecionarProduto = (nome) => {
-    const tamanhosComEstoque = produtos.filter(p => p.nome === nome && Number(p.quantidade) > 0);
-    const primeiro = tamanhosComEstoque[0];
-    setForm({ ...form, produto_nome: nome, tamanho: primeiro?.tamanho || "", custo: primeiro?.custo || "", valor: primeiro?.preco || "" });
+    const c = produtos.filter(p => p.nome === nome && Number(p.quantidade) > 0)[0];
+    setForm({ ...form, produto_nome: nome, tamanho: c?.tamanho || "", custo: c?.custo || "", valor: c?.preco || "" });
   };
-
   const selecionarTamanho = (tam) => {
-    const prod = produtos.find(p => p.nome === form.produto_nome && p.tamanho === tam);
-    setForm({ ...form, tamanho: tam, custo: prod?.custo || form.custo, valor: prod?.preco || form.valor });
+    const p = produtos.find(p => p.nome === form.produto_nome && p.tamanho === tam);
+    setForm({ ...form, tamanho: tam, custo: p?.custo || form.custo, valor: p?.preco || form.valor });
   };
 
   const salvar = async () => {
     if (!form.cliente_nome || !form.produto_nome || !form.valor) return;
     setSaving(true);
+    setErro(null);
     try {
       const custo = Number(form.custo) || Number(produtoEscolhido?.custo) || 0;
       const lucroCalc = Number(form.valor) - custo - Number(form.desconto || 0);
-      await add({ ...form, valor: Number(form.valor), custo, lucro: lucroCalc, desconto: Number(form.desconto || 0), frete: Number(form.frete || 0), quantidade: Number(form.quantidade) });
+      const payload = { ...form, valor: Number(form.valor), custo, lucro: lucroCalc, desconto: Number(form.desconto || 0), frete: Number(form.frete || 0), quantidade: Number(form.quantidade) };
+
+      // Tenta salvar com status; cai sem ele se coluna não existir
+      let saved;
+      try { saved = await add({ ...payload, status: "Concluída" }); }
+      catch { saved = await add(payload); }
+
+      // Rastreia no localStorage que essa venda já reduziu estoque
+      if (saved?.id) marcarSincronizada(saved.id);
 
       // Baixa no estoque
       if (produtoEscolhido) {
-        const novaQtd = Math.max(0, Number(produtoEscolhido.quantidade) - Number(form.quantidade));
-        await db.update("produtos", produtoEscolhido.id, { quantidade: novaQtd });
-        reloadProdutos();
+        await db.update("produtos", produtoEscolhido.id, {
+          quantidade: Math.max(0, Number(produtoEscolhido.quantidade) - Number(form.quantidade)),
+        });
+        await reloadProdutos();
       }
 
       setModal(false);
       setForm(empty);
+    } catch (e) {
+      setErro(e.message || "Erro ao salvar a venda.");
+    } finally { setSaving(false); }
+  };
+
+  // ── CANCELAMENTO ──────────────────────────────────────────────
+  const confirmarCancelar = async () => {
+    const v = modalCancelar;
+    setSaving(true);
+    try {
+      // Tenta marcar como cancelada no DB; fallback em obs se status não existir
+      try {
+        await edit(v.id, { status: "Cancelada", cancelado_em: new Date().toISOString() });
+      } catch {
+        await edit(v.id, { obs: `[CANCELADA em ${new Date().toLocaleDateString("pt-BR")}] ${v.obs || ""}`.trim() });
+      }
+
+      // Devolve estoque
+      const prod = produtos.find(p => p.nome === v.produto_nome && p.tamanho === v.tamanho);
+      if (prod) {
+        await db.update("produtos", prod.id, { quantidade: Number(prod.quantidade) + Number(v.quantidade) });
+        await reloadProdutos();
+      }
+
+      // Remove da lista de sincronizadas para evitar ressincronização futura
+      const s = getSincronizadas(); s.delete(String(v.id));
+      localStorage.setItem(SINC_KEY, JSON.stringify([...s]));
+
+      setModalCancelar(null);
+    } catch (e) {
+      alert("Erro ao cancelar: " + (e.message || "tente novamente"));
+    } finally { setSaving(false); }
+  };
+
+  // ── SINCRONIZAÇÃO MANUAL ─────────────────────────────────────
+  const executarSinc = async () => {
+    setSaving(true);
+    const log = { ok: [], semProduto: [], erros: [] };
+    try {
+      const sinc = getSincronizadas();
+      const pendentes = rows.filter(v => !isVendaCancelada(v) && !sinc.has(String(v.id)));
+      for (const v of pendentes) {
+        try {
+          const prod = produtos.find(p => p.nome === v.produto_nome && p.tamanho === v.tamanho);
+          if (prod) {
+            await db.update("produtos", prod.id, {
+              quantidade: Math.max(0, Number(prod.quantidade) - Number(v.quantidade)),
+            });
+            log.ok.push(`${v.produto_nome} ${v.tamanho} (${v.cliente_nome})`);
+          } else {
+            log.semProduto.push(`${v.produto_nome} ${v.tamanho} — produto não encontrado`);
+          }
+          marcarSincronizada(v.id);
+        } catch (e) {
+          log.erros.push(`${v.produto_nome}: ${e.message}`);
+        }
+      }
+      await reloadProdutos();
+      setSincLog(log);
     } finally { setSaving(false); }
   };
 
@@ -513,10 +593,21 @@ function Vendas() {
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 24 }}>
         <KpiCard label="Faturamento" value={fmt(fat)} icon="💰" />
         <KpiCard label="Lucro Total" value={fmt(lucro)} accent={C.yellow} icon="✨" />
-        <KpiCard label="Qtd Vendas" value={rows.length} icon="🛍️" />
+        <KpiCard label="Qtd Vendas" value={vendasAtivas.length} icon="🛍️" />
         <KpiCard label="Margem Média" value={`${margem.toFixed(1)}%`} accent={C.success} icon="📊" />
       </div>
-      <SectionHeader title="Registro de Vendas" action={<Btn onClick={() => setModal(true)}>+ Nova Venda</Btn>} />
+
+      {/* Aviso de vendas não sincronizadas */}
+      {naoSincronizadas.length > 0 && (
+        <div style={{ ...S.card, background: C.warnBg, border: `1px solid ${C.warn}44`, marginBottom: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ fontSize: 13, color: C.text }}>
+            ⚠️ <strong>{naoSincronizadas.length} venda{naoSincronizadas.length > 1 ? "s" : ""}</strong> anterior{naoSincronizadas.length > 1 ? "es" : ""} ao novo sistema pode{naoSincronizadas.length > 1 ? "m" : ""} não ter descontado o estoque.
+          </div>
+          <Btn onClick={() => { setSincLog(null); setModalSinc(true); }} style={{ ...S.btn, padding: "7px 14px", fontSize: 12 }}>Sincronizar Estoque</Btn>
+        </div>
+      )}
+
+      <SectionHeader title="Registro de Vendas" action={<Btn onClick={() => { setErro(null); setModal(true); }}>+ Nova Venda</Btn>} />
       <div style={S.card}>
         <Table
           cols={[
@@ -525,49 +616,44 @@ function Vendas() {
             { key: "produto_nome", label: "Produto" },
             { key: "tamanho", label: "Tam." },
             { key: "forma_pagamento", label: "Pgto", render: v => <Badge status={v} /> },
-            { key: "valor", label: "Valor", align: "right", render: v => fmt(v) },
-            { key: "custo", label: "Custo", align: "right", render: v => fmt(v) },
-            { key: "lucro", label: "Lucro", align: "right", render: v => <span style={{ color: C.success, fontWeight: 700 }}>{fmt(v)}</span> },
+            { key: "valor", label: "Valor", align: "right", render: (v, r) => <span style={{ textDecoration: isVendaCancelada(r) ? "line-through" : "none", color: isVendaCancelada(r) ? C.gray : C.text }}>{fmt(v)}</span> },
+            { key: "lucro", label: "Lucro", align: "right", render: (v, r) => isVendaCancelada(r) ? <Badge status="Cancelada" /> : <span style={{ color: C.success, fontWeight: 700 }}>{fmt(v)}</span> },
+            { key: "id", label: "", render: (v, r) => !isVendaCancelada(r) && (
+              <button onClick={() => setModalCancelar(r)} style={{ ...S.btnDanger, padding: "4px 10px", fontSize: 11 }}>✕ Cancelar</button>
+            )},
           ]}
           rows={rows}
           emptyMsg="Nenhuma venda registrada ainda."
         />
       </div>
 
+      {/* Modal: Nova Venda */}
       {modal && (
         <Modal title="Registrar Venda" onClose={() => setModal(false)}>
           <Field label="Cliente">
             <Input list="clientes-list" value={form.cliente_nome} onChange={e => setForm({ ...form, cliente_nome: e.target.value })} placeholder="Nome do cliente" />
             <datalist id="clientes-list">{clientes.map(c => <option key={c.id} value={c.nome} />)}</datalist>
           </Field>
-
-          {/* Passo 1: selecionar produto */}
           <Field label="Produto">
             <Input list="produtos-unicos-list" value={form.produto_nome} onChange={e => selecionarProduto(e.target.value)} placeholder="Buscar produto..." />
             <datalist id="produtos-unicos-list">{nomesUnicos.map(n => <option key={n} value={n} />)}</datalist>
           </Field>
-
-          {/* Passo 2: tamanho aparece após selecionar produto */}
           {form.produto_nome && (
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
               <Field label="Tamanho">
                 {tamanhosDisponiveis.length > 0
                   ? <Select value={form.tamanho} onChange={e => selecionarTamanho(e.target.value)} options={tamanhosDisponiveis} />
-                  : <div style={{ color: C.danger, fontSize: 12, padding: "10px 0" }}>⚠️ Sem estoque neste produto</div>
-                }
+                  : <div style={{ color: C.danger, fontSize: 12, padding: "10px 0" }}>⚠️ Sem estoque</div>}
               </Field>
               <Field label="Qtd"><Input type="number" value={form.quantidade} onChange={e => setForm({ ...form, quantidade: e.target.value })} /></Field>
               <Field label="Valor (R$)"><Input type="number" value={form.valor} onChange={e => setForm({ ...form, valor: e.target.value })} /></Field>
             </div>
           )}
-
-          {/* Passo 3: informações preenchidas automaticamente */}
           {produtoEscolhido && (
             <div style={{ background: C.successBg, border: `1px solid ${C.success}33`, borderRadius: 8, padding: "10px 14px", fontSize: 12, color: C.text, marginBottom: 10 }}>
               ✅ <strong>{produtoEscolhido.nome} {produtoEscolhido.tamanho}</strong> · Estoque: {produtoEscolhido.quantidade} un. · Custo: {fmt(produtoEscolhido.custo)}
             </div>
           )}
-
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
             <Field label="Custo (R$)"><Input type="number" value={form.custo} onChange={e => setForm({ ...form, custo: e.target.value })} /></Field>
             <Field label="Desconto (R$)"><Input type="number" value={form.desconto} onChange={e => setForm({ ...form, desconto: e.target.value })} /></Field>
@@ -582,11 +668,83 @@ function Vendas() {
               Lucro estimado: {fmt(Number(form.valor) - Number(form.custo) - Number(form.desconto || 0))}
             </div>
           )}
+          {erro && <div style={{ background: C.dangerBg, borderRadius: 8, padding: "10px 14px", fontSize: 13, color: C.danger, marginBottom: 12 }}>❌ {erro}</div>}
           <Field label="Observações"><Input value={form.obs} onChange={e => setForm({ ...form, obs: e.target.value })} /></Field>
           <div style={{ display: "flex", gap: 10 }}>
             <Btn onClick={salvar} disabled={saving}>{saving ? "Salvando..." : "Concluir Venda"}</Btn>
             <Btn ghost onClick={() => setModal(false)}>Cancelar</Btn>
           </div>
+        </Modal>
+      )}
+
+      {/* Modal: Confirmar Cancelamento */}
+      {modalCancelar && (
+        <Modal title="Cancelar Venda" onClose={() => setModalCancelar(null)}>
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: 14, marginBottom: 14, fontSize: 13 }}>
+            <div style={{ fontWeight: 700, color: C.white, marginBottom: 4 }}>{modalCancelar.produto_nome} {modalCancelar.tamanho}</div>
+            <div style={{ color: C.gray, fontSize: 12, marginBottom: 10 }}>Cliente: {modalCancelar.cliente_nome} · Data: {modalCancelar.data} · {fmt(modalCancelar.valor)}</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 5, fontSize: 12 }}>
+              <div>📦 Qtd vendida: <strong style={{ color: C.white }}>{modalCancelar.quantidade} un.</strong></div>
+              {(() => {
+                const p = produtos.find(x => x.nome === modalCancelar.produto_nome && x.tamanho === modalCancelar.tamanho);
+                return p
+                  ? <div style={{ color: C.success }}>✅ Estoque voltará de {p.quantidade} → {Number(p.quantidade) + Number(modalCancelar.quantidade)} un.</div>
+                  : <div style={{ color: C.warn }}>⚠️ Produto não encontrado no estoque — devolução não será feita automaticamente.</div>;
+              })()}
+              <div style={{ color: C.danger }}>💰 Faturamento reduzirá em {fmt(modalCancelar.valor)}</div>
+              <div style={{ color: C.danger }}>📊 Lucro reduzirá em {fmt(modalCancelar.lucro)}</div>
+            </div>
+          </div>
+          <div style={{ background: C.warnBg, border: `1px solid ${C.warn}44`, borderRadius: 6, padding: "8px 12px", marginBottom: 14, fontSize: 12, color: C.warn }}>
+            ⚠️ Esta ação desfaz todos os efeitos desta venda no estoque e financeiro. A venda permanecerá no histórico como <strong>Cancelada</strong>.
+          </div>
+          <div style={{ display: "flex", gap: 10 }}>
+            <button onClick={confirmarCancelar} disabled={saving} style={{ ...S.btnDanger, padding: "10px 20px", fontSize: 13, fontWeight: 800 }}>
+              {saving ? "Cancelando..." : "✕ Confirmar Cancelamento"}
+            </button>
+            <Btn ghost onClick={() => setModalCancelar(null)}>Voltar</Btn>
+          </div>
+        </Modal>
+      )}
+
+      {/* Modal: Sincronização de Estoque */}
+      {modalSinc && (
+        <Modal title="Sincronizar Estoque de Vendas Antigas" onClose={() => { setModalSinc(false); setSincLog(null); }}>
+          {!sincLog ? (
+            <>
+              <div style={{ background: C.warnBg, border: `1px solid ${C.warn}44`, borderRadius: 8, padding: 14, marginBottom: 14, fontSize: 13, color: C.text }}>
+                <div style={{ fontWeight: 700, color: C.warn, marginBottom: 8 }}>⚠️ Atenção antes de sincronizar</div>
+                <div style={{ fontSize: 12, lineHeight: 1.6 }}>
+                  Esta ação descontará do estoque as <strong>{naoSincronizadas.length} venda{naoSincronizadas.length > 1 ? "s" : ""}</strong> que o sistema não rastreou automaticamente.<br /><br />
+                  <strong>Faça isso apenas uma vez.</strong> Se o estoque já foi ajustado manualmente, essa ação pode deixá-lo negativo.<br /><br />
+                  Vendas que serão processadas:
+                </div>
+                <div style={{ marginTop: 10, maxHeight: 180, overflowY: "auto" }}>
+                  {naoSincronizadas.map(v => (
+                    <div key={v.id} style={{ fontSize: 11, color: C.textMuted, padding: "2px 0" }}>
+                      {v.data} · {v.cliente_nome} · {v.produto_nome} {v.tamanho} · {v.quantidade} un. · {fmt(v.valor)}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 10 }}>
+                <button onClick={executarSinc} disabled={saving} style={{ ...S.btn, padding: "10px 20px", fontSize: 13 }}>
+                  {saving ? "Sincronizando..." : `Sincronizar ${naoSincronizadas.length} venda${naoSincronizadas.length > 1 ? "s" : ""}`}
+                </button>
+                <Btn ghost onClick={() => { setModalSinc(false); setSincLog(null); }}>Cancelar</Btn>
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{ background: C.successBg, borderRadius: 8, padding: 14, marginBottom: 14, fontSize: 13 }}>
+                <div style={{ color: C.success, fontWeight: 700, marginBottom: 8 }}>✅ Sincronização concluída</div>
+                {sincLog.ok.length > 0 && <div style={{ fontSize: 12, marginBottom: 6 }}><strong>{sincLog.ok.length}</strong> item{sincLog.ok.length > 1 ? "s" : ""} atualizados no estoque.</div>}
+                {sincLog.semProduto.length > 0 && <div style={{ fontSize: 12, color: C.warn, marginBottom: 4 }}><strong>{sincLog.semProduto.length}</strong> sem produto encontrado (estoque não alterado).</div>}
+                {sincLog.erros.length > 0 && <div style={{ fontSize: 12, color: C.danger }}><strong>{sincLog.erros.length}</strong> erro{sincLog.erros.length > 1 ? "s" : ""}.</div>}
+              </div>
+              <Btn onClick={() => { setModalSinc(false); setSincLog(null); }}>Fechar</Btn>
+            </>
+          )}
         </Modal>
       )}
     </div>
