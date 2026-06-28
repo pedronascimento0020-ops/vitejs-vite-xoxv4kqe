@@ -760,19 +760,26 @@ function Clientes() {
   const [modal, setModal] = useState(false);
   const [detalhe, setDetalhe] = useState(null);
   const [saving, setSaving] = useState(false);
-  const empty = { nome: "", whatsapp: "", instagram: "", cidade: "", time_favorito: "", aniversario: "", obs: "" };
+  const [erroCliente, setErroCliente] = useState(null);
+  // aniversario removido — coluna não existe no banco
+  const empty = { nome: "", whatsapp: "", instagram: "", cidade: "", time_favorito: "", obs: "" };
   const [form, setForm] = useState(empty);
 
   const clienteVendas = (nome) => vendas.filter(v => v.cliente_nome === nome);
   const msgWhats = (nome, valor) => encodeURIComponent(`Fala, ${nome}! Passando para lembrar do pagamento de ${fmt(valor)} da Vibra FC. Pode fazer o PIX e me manda o comprovante. Obrigado! ⚡`);
 
   const salvar = async () => {
-    if (!form.nome) return;
+    if (!form.nome.trim()) { setErroCliente("O nome do cliente é obrigatório."); return; }
+    const duplicado = rows.find(r => r.nome.trim().toLowerCase() === form.nome.trim().toLowerCase());
+    if (duplicado) { setErroCliente(`Já existe um cliente com o nome "${duplicado.nome}".`); return; }
     setSaving(true);
+    setErroCliente(null);
     try {
       await add(form);
       setModal(false);
       setForm(empty);
+    } catch (e) {
+      setErroCliente(e.message || "Erro ao salvar cliente. Tente novamente.");
     } finally { setSaving(false); }
   };
 
@@ -837,18 +844,19 @@ function Clientes() {
       )}
 
       {modal && (
-        <Modal title="Novo Cliente" onClose={() => setModal(false)}>
+        <Modal title="Novo Cliente" onClose={() => { setModal(false); setErroCliente(null); setForm(empty); }}>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-            <div style={{ gridColumn: "1/-1" }}><Field label="Nome"><Input value={form.nome} onChange={e => setForm({ ...form, nome: e.target.value })} /></Field></div>
+            <div style={{ gridColumn: "1/-1" }}><Field label="Nome *"><Input value={form.nome} onChange={e => { setErroCliente(null); setForm({ ...form, nome: e.target.value }); }} placeholder="Nome completo" /></Field></div>
             <Field label="WhatsApp"><Input value={form.whatsapp} onChange={e => setForm({ ...form, whatsapp: e.target.value })} placeholder="11999990000" /></Field>
             <Field label="Instagram"><Input value={form.instagram} onChange={e => setForm({ ...form, instagram: e.target.value })} placeholder="@usuario" /></Field>
             <Field label="Cidade"><Input value={form.cidade} onChange={e => setForm({ ...form, cidade: e.target.value })} /></Field>
             <Field label="Time Favorito"><Input value={form.time_favorito} onChange={e => setForm({ ...form, time_favorito: e.target.value })} /></Field>
             <div style={{ gridColumn: "1/-1" }}><Field label="Observações"><Input value={form.obs} onChange={e => setForm({ ...form, obs: e.target.value })} placeholder="Preferências, indicações, observações..." /></Field></div>
           </div>
+          {erroCliente && <div style={{ background: C.dangerBg, border: `1px solid ${C.danger}44`, borderRadius: 8, padding: "10px 14px", fontSize: 13, color: C.danger, marginBottom: 4 }}>❌ {erroCliente}</div>}
           <div style={{ display: "flex", gap: 10 }}>
-            <Btn onClick={salvar} disabled={saving}>{saving ? "Salvando..." : "Salvar"}</Btn>
-            <Btn ghost onClick={() => setModal(false)}>Cancelar</Btn>
+            <Btn onClick={salvar} disabled={saving}>{saving ? "Salvando..." : "Salvar Cliente"}</Btn>
+            <Btn ghost onClick={() => { setModal(false); setErroCliente(null); setForm(empty); }}>Cancelar</Btn>
           </div>
         </Modal>
       )}
@@ -1047,72 +1055,187 @@ function Fiado() {
 // MÓDULO: FINANCEIRO
 // ============================================================
 function Financeiro() {
-  const { rows, loading, add } = useTable("financeiro");
+  const { rows: manual, loading: loadingFin, add } = useTable("financeiro");
+  const { rows: vendas, loading: loadingVendas } = useTable("vendas");
+  const { rows: compras, loading: loadingCompras } = useTable("compras");
   const [modal, setModal] = useState(false);
   const [filtro, setFiltro] = useState("todos");
+  const [periodoFiltro, setPeriodoFiltro] = useState("todos");
   const [saving, setSaving] = useState(false);
-  const empty = { tipo: "entrada", categoria: "Venda", descricao: "", valor: "", data: today() };
+  const [erroFin, setErroFin] = useState(null);
+  const empty = { tipo: "saida", categoria: "Outros", descricao: "", valor: "", data: today(), forma_pagamento: "" };
   const [form, setForm] = useState(empty);
 
-  const entradas = rows.filter(m => m.tipo === "entrada").reduce((a, m) => a + Number(m.valor || 0), 0);
-  const saidas = rows.filter(m => m.tipo === "saida").reduce((a, m) => a + Number(m.valor || 0), 0);
-  const filtrados = rows.filter(m => filtro === "todos" || m.tipo === filtro);
+  // ── Entradas automáticas: vendas não canceladas ────────────
+  const autoEntradas = vendas
+    .filter(v => !isVendaCancelada(v))
+    .map(v => ({
+      id: `venda_${v.id}`,
+      tipo: "entrada",
+      categoria: "Venda",
+      descricao: `Venda – ${v.cliente_nome || "Cliente"} – ${v.produto_nome || ""} ${v.tamanho || ""}`.trim(),
+      valor: Number(v.valor || 0),
+      data: v.data,
+      forma_pagamento: v.forma_pagamento || "",
+      origem: "venda",
+      origem_id: v.id,
+    }));
+
+  // ── Saídas automáticas: compras ────────────────────────────
+  // Agrupa por fornecedor+data para evitar duplicar linhas de um mesmo pedido multi-item
+  const pedidosMap = new Map();
+  compras.forEach(c => {
+    const key = `${c.fornecedor}|${c.data}`;
+    if (!pedidosMap.has(key)) pedidosMap.set(key, { fornecedor: c.fornecedor, data: c.data, total: 0, ids: [] });
+    const g = pedidosMap.get(key);
+    g.total += Number(c.total || 0);
+    g.ids.push(c.id);
+  });
+  const autoSaidas = [...pedidosMap.entries()].map(([key, g]) => ({
+    id: `compra_${key}`,
+    tipo: "saida",
+    categoria: "Compra de estoque",
+    descricao: `Compra – ${g.fornecedor}`,
+    valor: g.total,
+    data: g.data,
+    forma_pagamento: "",
+    origem: "compra",
+    origem_id: key,
+  }));
+
+  // ── Lançamentos manuais ────────────────────────────────────
+  const manualRows = manual.map(m => ({ ...m, origem: "manual" }));
+
+  // ── Unificado ──────────────────────────────────────────────
+  const todasMovs = [...autoEntradas, ...autoSaidas, ...manualRows]
+    .sort((a, b) => (b.data || "").localeCompare(a.data || ""));
+
+  // ── Filtro por período ──────────────────────────────────────
+  const hoje = new Date();
+  const movsFiltradas = todasMovs.filter(m => {
+    if (periodoFiltro === "mes") {
+      const d = new Date(m.data);
+      return d.getFullYear() === hoje.getFullYear() && d.getMonth() === hoje.getMonth();
+    }
+    if (periodoFiltro === "ano") return new Date(m.data).getFullYear() === hoje.getFullYear();
+    return true;
+  }).filter(m => filtro === "todos" || m.tipo === filtro);
+
+  // ── KPIs ──────────────────────────────────────────────────
+  const totEntradas = movsFiltradas.filter(m => m.tipo === "entrada").reduce((a, m) => a + Number(m.valor || 0), 0);
+  const totSaidas = movsFiltradas.filter(m => m.tipo === "saida").reduce((a, m) => a + Number(m.valor || 0), 0);
+  const saldo = totEntradas - totSaidas;
+  const receitaVendas = autoEntradas.reduce((a, m) => a + m.valor, 0);
+  const custoCompras = autoSaidas.reduce((a, m) => a + m.valor, 0);
+  const lucroVendas = vendas.filter(v => !isVendaCancelada(v)).reduce((a, v) => a + Number(v.lucro || 0), 0);
+  const margem = receitaVendas > 0 ? (lucroVendas / receitaVendas) * 100 : 0;
+
+  // ── Por forma de pagamento ────────────────────────────────
+  const porPgto = {};
+  autoEntradas.forEach(m => { porPgto[m.forma_pagamento || "Outro"] = (porPgto[m.forma_pagamento || "Outro"] || 0) + m.valor; });
 
   const salvar = async () => {
-    if (!form.descricao || !form.valor) return;
+    if (!form.descricao || !form.valor) { setErroFin("Preencha descrição e valor."); return; }
     setSaving(true);
+    setErroFin(null);
     try {
-      await add({ ...form, valor: Number(form.valor) });
+      const payload = { tipo: form.tipo, categoria: form.categoria, descricao: form.descricao, valor: Number(form.valor), data: form.data };
+      if (form.forma_pagamento) payload.forma_pagamento = form.forma_pagamento;
+      await add(payload);
       setModal(false);
       setForm(empty);
+    } catch (e) {
+      setErroFin(e.message || "Erro ao salvar lançamento.");
     } finally { setSaving(false); }
   };
 
-  if (loading) return <Loading />;
+  if (loadingFin || loadingVendas || loadingCompras) return <Loading />;
 
   return (
     <div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12, marginBottom: 24 }}>
-        <KpiCard label="Entradas" value={fmt(entradas)} accent={C.success} icon="📈" />
-        <KpiCard label="Saídas" value={fmt(saidas)} accent={C.danger} icon="📉" />
-        <KpiCard label="Saldo" value={fmt(entradas - saidas)} accent={entradas - saidas >= 0 ? C.yellow : C.danger} icon="💵" />
+      {/* KPIs principais */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12, marginBottom: 12 }}>
+        <KpiCard label="Entradas" value={fmt(totEntradas)} accent={C.success} icon="📈" />
+        <KpiCard label="Saídas" value={fmt(totSaidas)} accent={C.danger} icon="📉" />
+        <KpiCard label="Saldo" value={fmt(saldo)} accent={saldo >= 0 ? C.yellow : C.danger} icon="💵" />
       </div>
+      {/* KPIs secundários */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 24 }}>
+        <KpiCard label="Receita Vendas" value={fmt(receitaVendas)} accent={C.success} icon="🛍️" />
+        <KpiCard label="Custo Compras" value={fmt(custoCompras)} accent={C.danger} icon="📦" />
+        <KpiCard label="Lucro Líquido" value={fmt(lucroVendas)} accent={C.yellow} icon="✨" />
+        <KpiCard label="Margem" value={`${margem.toFixed(1)}%`} accent={margem >= 30 ? C.success : margem >= 15 ? C.warn : C.danger} icon="📊" />
+      </div>
+
+      {/* Por forma de pagamento */}
+      {Object.keys(porPgto).length > 0 && (
+        <div style={{ ...S.card, marginBottom: 20 }}>
+          <div style={S.sectionTitle}>Receita por Forma de Pagamento</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
+            {Object.entries(porPgto).sort((a, b) => b[1] - a[1]).map(([pgto, val]) => (
+              <div key={pgto} style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 16px", minWidth: 120 }}>
+                <div style={{ fontSize: 11, color: C.gray, marginBottom: 4 }}>{pgto}</div>
+                <div style={{ fontSize: 18, fontWeight: 800, color: C.success }}>{fmt(val)}</div>
+                <div style={{ fontSize: 11, color: C.textMuted }}>{receitaVendas > 0 ? ((val / receitaVendas) * 100).toFixed(0) : 0}%</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <SectionHeader title="Movimentações" action={
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {/* Filtro período */}
+          {["todos", "mes", "ano"].map(p => (
+            <button key={p} onClick={() => setPeriodoFiltro(p)} style={{ ...S.btnGhost, padding: "6px 12px", fontSize: 11, background: periodoFiltro === p ? C.infoBg : "transparent", color: periodoFiltro === p ? C.info : C.gray, borderColor: periodoFiltro === p ? C.info : C.border }}>
+              {p === "todos" ? "Tudo" : p === "mes" ? "Este mês" : "Este ano"}
+            </button>
+          ))}
+          <div style={{ width: 1, background: C.border }} />
+          {/* Filtro tipo */}
           {["todos", "entrada", "saida"].map(f => (
-            <button key={f} onClick={() => setFiltro(f)} style={{ ...S.btnGhost, padding: "6px 14px", background: filtro === f ? C.yellowBg : "transparent", color: filtro === f ? C.yellow : C.gray, borderColor: filtro === f ? C.yellow : C.border }}>
+            <button key={f} onClick={() => setFiltro(f)} style={{ ...S.btnGhost, padding: "6px 12px", fontSize: 11, background: filtro === f ? C.yellowBg : "transparent", color: filtro === f ? C.yellow : C.gray, borderColor: filtro === f ? C.yellow : C.border }}>
               {f === "todos" ? "Todos" : f === "entrada" ? "Entradas" : "Saídas"}
             </button>
           ))}
-          <Btn onClick={() => setModal(true)}>+ Lançamento</Btn>
+          <Btn onClick={() => { setErroFin(null); setModal(true); }}>+ Lançamento</Btn>
         </div>
       } />
       <div style={S.card}>
         <Table
           cols={[
             { key: "data", label: "Data" },
-            { key: "tipo", label: "Tipo", render: v => <span style={{ color: v === "entrada" ? C.success : C.danger, fontWeight: 700, fontSize: 11, textTransform: "uppercase" }}>{v}</span> },
+            { key: "tipo", label: "Tipo", render: v => <span style={{ color: v === "entrada" ? C.success : C.danger, fontWeight: 700, fontSize: 11, textTransform: "uppercase" }}>{v === "entrada" ? "↑ Entrada" : "↓ Saída"}</span> },
             { key: "categoria", label: "Categoria" },
             { key: "descricao", label: "Descrição" },
+            { key: "origem", label: "Origem", render: v => {
+              if (v === "venda") return <span style={S.badge(C.success, C.successBg)}>Venda</span>;
+              if (v === "compra") return <span style={S.badge(C.info, C.infoBg)}>Compra</span>;
+              return <span style={S.badge(C.gray, "#222")}>Manual</span>;
+            }},
             { key: "valor", label: "Valor", align: "right", render: (v, r) => <span style={{ color: r.tipo === "entrada" ? C.success : C.danger, fontWeight: 700 }}>{r.tipo === "saida" ? "−" : "+"}{fmt(v)}</span> },
           ]}
-          rows={filtrados}
-          emptyMsg="Nenhuma movimentação registrada."
+          rows={movsFiltradas}
+          emptyMsg="Nenhuma movimentação no período."
         />
       </div>
 
       {modal && (
-        <Modal title="Novo Lançamento" onClose={() => setModal(false)}>
-          <Field label="Tipo"><Select value={form.tipo} onChange={e => setForm({ ...form, tipo: e.target.value })} options={[{ value: "entrada", label: "Entrada" }, { value: "saida", label: "Saída" }]} /></Field>
+        <Modal title="Novo Lançamento Manual" onClose={() => setModal(false)}>
+          <div style={{ background: C.infoBg, border: `1px solid ${C.info}33`, borderRadius: 8, padding: "8px 14px", fontSize: 12, color: C.textMuted, marginBottom: 14 }}>
+            ℹ️ Use para despesas e receitas avulsas (motoboy, embalagem, etc). Vendas e compras são lançadas automaticamente.
+          </div>
+          <Field label="Tipo"><Select value={form.tipo} onChange={e => setForm({ ...form, tipo: e.target.value })} options={[{ value: "saida", label: "Saída (Despesa)" }, { value: "entrada", label: "Entrada (Receita extra)" }]} /></Field>
           <Field label="Categoria">
             <Select value={form.categoria} onChange={e => setForm({ ...form, categoria: e.target.value })}
-              options={form.tipo === "entrada" ? ["Venda", "Frete cobrado", "Personalização", "Outra receita"] : ["Estoque", "Motoboy", "Tráfego pago", "Marketing", "Parcerias", "Embalagens", "Assinaturas", "Taxas", "Outros"]} />
+              options={form.tipo === "entrada" ? ["Frete cobrado", "Personalização", "Outra receita"] : ["Motoboy", "Tráfego pago", "Marketing", "Parcerias", "Embalagens", "Assinaturas", "Taxas", "Outros"]} />
           </Field>
-          <Field label="Descrição"><Input value={form.descricao} onChange={e => setForm({ ...form, descricao: e.target.value })} /></Field>
+          <Field label="Descrição"><Input value={form.descricao} onChange={e => setForm({ ...form, descricao: e.target.value })} placeholder="Ex: Motoboy entrega bairro X" /></Field>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
             <Field label="Valor (R$)"><Input type="number" value={form.valor} onChange={e => setForm({ ...form, valor: e.target.value })} /></Field>
             <Field label="Data"><Input type="date" value={form.data} onChange={e => setForm({ ...form, data: e.target.value })} /></Field>
           </div>
+          {erroFin && <div style={{ background: C.dangerBg, borderRadius: 8, padding: "10px 14px", fontSize: 13, color: C.danger, marginBottom: 4 }}>❌ {erroFin}</div>}
           <div style={{ display: "flex", gap: 10 }}>
             <Btn onClick={salvar} disabled={saving}>{saving ? "Salvando..." : "Salvar Lançamento"}</Btn>
             <Btn ghost onClick={() => setModal(false)}>Cancelar</Btn>
