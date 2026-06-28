@@ -1059,22 +1059,42 @@ function Metas() {
 // ============================================================
 function Fornecedores() {
   const { rows: fornecedores, loading, add: addForn } = useTable("fornecedores", "nome.asc");
-  const { rows: compras, add: addCompra, edit: editCompra } = useTable("compras");
+  const { rows: compras, add: addCompra, edit: editCompra, remove: removeCompra, reload: reloadCompras } = useTable("compras");
   const { rows: produtos, reload: reloadProdutos } = useTable("produtos", "nome.asc");
   const [aba, setAba] = useState("fornecedores");
   const [modalForn, setModalForn] = useState(false);
   const [modalCompra, setModalCompra] = useState(false);
+  const [modalConfirm, setModalConfirm] = useState(null);
   const [saving, setSaving] = useState(false);
   const emptyF = { nome: "", whatsapp: "", instagram: "", cidade: "", prazo: "", obs: "" };
   const emptyC = { fornecedor: "", produto_nome: "", tamanho: "M", quantidade: "", valor_unit: "", frete: 0, data: today(), prazo_entrega: "", status: "Pedido realizado" };
   const [formF, setFormF] = useState(emptyF);
   const [formC, setFormC] = useState(emptyC);
 
-  const totalInvestido = compras.reduce((a, c) => a + Number(c.total || 0), 0);
+  const comprasAtivas = compras.filter(c => c.status !== "Cancelado");
+  const totalInvestido = comprasAtivas.reduce((a, c) => a + Number(c.total || 0), 0);
   const produtosUnicos = [...new Set(produtos.map(p => p.nome))].sort();
   const tamanhosPorProduto = formC.produto_nome
     ? produtos.filter(p => p.nome === formC.produto_nome).map(p => p.tamanho)
     : ["PP", "P", "M", "G", "GG", "2GG", "3GG", "4GG"];
+
+  // Localiza o produto no estoque para uma compra
+  const getProdEstoque = (compra) => {
+    if (compra.produto_nome && compra.tamanho) {
+      return produtos.find(p => p.nome === compra.produto_nome && p.tamanho === compra.tamanho);
+    }
+    return produtos.find(p => `${p.nome} ${p.tamanho}` === compra.produto || p.nome === compra.produto);
+  };
+
+  // Calcula quantas unidades ainda estão em estoque vs quantas já foram vendidas
+  const calcImpacto = (compra) => {
+    const prod = getProdEstoque(compra);
+    const qtdCompra = Number(compra.quantidade);
+    const estoqueAtual = Number(prod?.quantidade ?? 0);
+    const jaVendido = Math.max(0, qtdCompra - estoqueAtual);
+    const podeRemover = Math.min(qtdCompra, estoqueAtual);
+    return { prod, jaVendido, podeRemover, qtdCompra, estoqueAtual };
+  };
 
   const salvarForn = async () => {
     if (!formF.nome) return;
@@ -1092,18 +1112,49 @@ function Fornecedores() {
 
       await addCompra({ ...formC, produto: nomeProduto, quantidade: qtd, valor_unit: vunit, frete, total });
 
-      // Atualiza estoque automaticamente
       const prodEstoque = produtos.find(p => p.nome === formC.produto_nome && p.tamanho === formC.tamanho);
       if (prodEstoque) {
-        await db.update("produtos", prodEstoque.id, {
-          quantidade: Number(prodEstoque.quantidade) + qtd,
-          custo: vunit,
-        });
+        await db.update("produtos", prodEstoque.id, { quantidade: Number(prodEstoque.quantidade) + qtd, custo: vunit });
         reloadProdutos();
       }
 
       setModalCompra(false);
       setFormC(emptyC);
+    } finally { setSaving(false); }
+  };
+
+  const abrirCancelar = (compra) => {
+    if (compra.status === "Cancelado") return;
+    setModalConfirm({ tipo: "cancelar", compra, ...calcImpacto(compra) });
+  };
+
+  const confirmarCancelar = async () => {
+    const { compra, prod, podeRemover } = modalConfirm;
+    setSaving(true);
+    try {
+      await editCompra(compra.id, { status: "Cancelado" });
+      if (prod && podeRemover > 0) {
+        await db.update("produtos", prod.id, { quantidade: Number(prod.quantidade) - podeRemover });
+        reloadProdutos();
+      }
+      setModalConfirm(null);
+    } finally { setSaving(false); }
+  };
+
+  const abrirExcluir = (compra) => {
+    setModalConfirm({ tipo: "excluir", compra, ...calcImpacto(compra) });
+  };
+
+  const confirmarExcluir = async () => {
+    const { compra, prod, podeRemover } = modalConfirm;
+    setSaving(true);
+    try {
+      if (compra.status !== "Cancelado" && prod && podeRemover > 0) {
+        await db.update("produtos", prod.id, { quantidade: Number(prod.quantidade) - podeRemover });
+        reloadProdutos();
+      }
+      await removeCompra(compra.id);
+      setModalConfirm(null);
     } finally { setSaving(false); }
   };
 
@@ -1155,12 +1206,26 @@ function Fornecedores() {
                 { key: "tamanho", label: "Tam." },
                 { key: "quantidade", label: "Qtd", align: "center" },
                 { key: "valor_unit", label: "Unit.", align: "right", render: v => fmt(v) },
-                { key: "total", label: "Total", align: "right", render: v => <span style={{ color: C.yellow, fontWeight: 700 }}>{fmt(v)}</span> },
-                { key: "status", label: "Status", render: v => <Badge status={v} /> },
-                { key: "id", label: "Atualizar", render: (v, r) => (
-                  <select value={r.status} onChange={e => editCompra(v, { status: e.target.value })} style={{ ...S.input, padding: "4px 8px", fontSize: 11, width: "auto" }}>
-                    {["Pedido realizado", "Aguardando envio", "Em trânsito", "Recebido", "Cancelado"].map(s => <option key={s}>{s}</option>)}
-                  </select>
+                { key: "total", label: "Total", align: "right", render: (v, r) => (
+                  <span style={{ color: r.status === "Cancelado" ? C.gray : C.yellow, fontWeight: 700, textDecoration: r.status === "Cancelado" ? "line-through" : "none" }}>{fmt(v)}</span>
+                )},
+                { key: "status", label: "Status", render: (v, r) => (
+                  r.status === "Cancelado"
+                    ? <Badge status="Cancelado" />
+                    : <select value={r.status} onChange={e => {
+                        if (e.target.value === "Cancelado") { abrirCancelar(r); }
+                        else { editCompra(r.id, { status: e.target.value }); }
+                      }} style={{ ...S.input, padding: "4px 8px", fontSize: 11, width: "auto" }}>
+                        {["Pedido realizado", "Aguardando envio", "Em trânsito", "Recebido", "Cancelado"].map(s => <option key={s}>{s}</option>)}
+                      </select>
+                )},
+                { key: "id", label: "Ações", render: (v, r) => (
+                  <div style={{ display: "flex", gap: 4 }}>
+                    {r.status !== "Cancelado" && (
+                      <button onClick={() => abrirCancelar(r)} style={{ ...S.btnDanger, padding: "4px 8px", fontSize: 11 }}>✕ Cancelar</button>
+                    )}
+                    <button onClick={() => abrirExcluir(r)} style={{ ...S.btnDanger, padding: "4px 8px", fontSize: 11 }}>🗑</button>
+                  </div>
                 )},
               ]}
               rows={compras}
@@ -1230,6 +1295,60 @@ function Fornecedores() {
           </div>
         </Modal>
       )}
+
+      {modalConfirm && (() => {
+        const { tipo, compra, prod, jaVendido, podeRemover, qtdCompra, estoqueAtual } = modalConfirm;
+        const titulo = tipo === "cancelar" ? "Cancelar Compra" : "Excluir Compra";
+        const isExcluirCancelada = tipo === "excluir" && compra.status === "Cancelado";
+        return (
+          <Modal title={titulo} onClose={() => setModalConfirm(null)}>
+            <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: 14, marginBottom: 14, fontSize: 13 }}>
+              <div style={{ fontWeight: 700, color: C.white, marginBottom: 4 }}>{compra.produto}{compra.tamanho && compra.produto_nome ? ` ${compra.tamanho}` : ""}</div>
+              <div style={{ color: C.gray, fontSize: 12, marginBottom: 10 }}>Fornecedor: {compra.fornecedor} · Data: {compra.data} · {fmt(compra.total)}</div>
+              {!isExcluirCancelada && (
+                <>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12 }}>
+                    <div>📦 Quantidade comprada: <strong style={{ color: C.white }}>{qtdCompra} un.</strong></div>
+                    <div>🏬 Estoque atual: <strong style={{ color: estoqueAtual > 0 ? C.success : C.danger }}>{prod ? `${estoqueAtual} un.` : "Produto não encontrado no estoque"}</strong></div>
+                    {jaVendido > 0 && <div style={{ color: C.warn }}>🛍️ Já foram vendidas: <strong>{jaVendido} un.</strong> (histórico de vendas mantido)</div>}
+                    <div style={{ color: C.success, fontWeight: 700 }}>✅ Serão removidas do estoque: {podeRemover} un.</div>
+                  </div>
+                  {jaVendido > 0 && (
+                    <div style={{ background: C.warnBg, border: `1px solid ${C.warn}44`, borderRadius: 6, padding: "8px 12px", marginTop: 10, fontSize: 12, color: C.warn }}>
+                      ⚠️ {jaVendido} unidade{jaVendido > 1 ? "s foram" : " foi"} vendida{jaVendido > 1 ? "s" : ""} e não {jaVendido > 1 ? "serão removidas" : "será removida"} do histórico. Apenas as {podeRemover} unidades restantes em estoque serão estornadas.
+                    </div>
+                  )}
+                  {!prod && (
+                    <div style={{ background: C.infoBg, borderRadius: 6, padding: "8px 12px", marginTop: 10, fontSize: 12, color: C.info }}>
+                      ℹ️ Produto não localizado no estoque. Nenhuma alteração será feita no estoque, apenas no registro da compra.
+                    </div>
+                  )}
+                </>
+              )}
+              {isExcluirCancelada && (
+                <div style={{ fontSize: 12, color: C.gray }}>Esta compra já está cancelada e não impacta o estoque. Será removida permanentemente do histórico.</div>
+              )}
+            </div>
+            {tipo === "cancelar" && (
+              <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 14 }}>
+                O registro ficará visível no histórico com status <strong>Cancelado</strong> e não contará para relatórios ou custo ativo.
+              </div>
+            )}
+            {tipo === "excluir" && !isExcluirCancelada && (
+              <div style={{ background: C.dangerBg, border: `1px solid ${C.danger}44`, borderRadius: 6, padding: "8px 12px", marginBottom: 14, fontSize: 12, color: C.danger }}>
+                🗑️ A exclusão é permanente. O registro será apagado completamente do sistema.
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 10 }}>
+              {tipo === "cancelar"
+                ? <button onClick={confirmarCancelar} disabled={saving} style={{ ...S.btnDanger, padding: "10px 20px", fontSize: 13, fontWeight: 800 }}>{saving ? "Cancelando..." : "✕ Confirmar Cancelamento"}</button>
+                : <button onClick={confirmarExcluir} disabled={saving} style={{ ...S.btnDanger, padding: "10px 20px", fontSize: 13, fontWeight: 800 }}>{saving ? "Excluindo..." : "🗑 Confirmar Exclusão"}</button>
+              }
+              <Btn ghost onClick={() => setModalConfirm(null)}>Voltar</Btn>
+            </div>
+          </Modal>
+        );
+      })()}
     </div>
   );
 }
