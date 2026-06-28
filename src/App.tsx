@@ -1059,41 +1059,57 @@ function Metas() {
 // ============================================================
 function Fornecedores() {
   const { rows: fornecedores, loading, add: addForn } = useTable("fornecedores", "nome.asc");
-  const { rows: compras, add: addCompra, edit: editCompra, remove: removeCompra, reload: reloadCompras } = useTable("compras");
+  const { rows: compras, add: addCompra, edit: editCompra, remove: removeCompra } = useTable("compras");
   const { rows: produtos, reload: reloadProdutos } = useTable("produtos", "nome.asc");
   const [aba, setAba] = useState("fornecedores");
   const [modalForn, setModalForn] = useState(false);
   const [modalCompra, setModalCompra] = useState(false);
   const [modalConfirm, setModalConfirm] = useState(null);
+  const [expandido, setExpandido] = useState({});
   const [saving, setSaving] = useState(false);
   const emptyF = { nome: "", whatsapp: "", instagram: "", cidade: "", prazo: "", obs: "" };
-  const emptyC = { fornecedor: "", produto_nome: "", tamanho: "M", quantidade: "", valor_unit: "", frete: 0, data: today(), prazo_entrega: "", status: "Pedido realizado" };
+  const emptyHeader = { fornecedor: "", data: today(), prazo_entrega: "", frete: "" };
+  const emptyItem = { produto_nome: "", tamanho: "M", quantidade: "", valor_unit: "" };
   const [formF, setFormF] = useState(emptyF);
-  const [formC, setFormC] = useState(emptyC);
+  const [pedidoHeader, setPedidoHeader] = useState(emptyHeader);
+  const [pedidoItens, setPedidoItens] = useState([{ ...emptyItem }]);
 
+  const produtosUnicos = [...new Set(produtos.map(p => p.nome))].sort();
   const comprasAtivas = compras.filter(c => c.status !== "Cancelado");
   const totalInvestido = comprasAtivas.reduce((a, c) => a + Number(c.total || 0), 0);
-  const produtosUnicos = [...new Set(produtos.map(p => p.nome))].sort();
-  const tamanhosPorProduto = formC.produto_nome
-    ? produtos.filter(p => p.nome === formC.produto_nome).map(p => p.tamanho)
-    : ["PP", "P", "M", "G", "GG", "2GG", "3GG", "4GG"];
 
-  // Localiza o produto no estoque para uma compra
+  // Agrupa compras por fornecedor+data (pedido)
+  const pedidosMap = compras.reduce((acc, c) => {
+    const key = `${c.fornecedor}|${c.data}`;
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(c);
+    return acc;
+  }, {});
+  const pedidosOrdenados = Object.entries(pedidosMap).sort((a, b) =>
+    (b[1][0].data || "").localeCompare(a[1][0].data || "")
+  );
+
+  // Subtotal do carrinho em construção
+  const subtotalPedido = pedidoItens.reduce((a, i) => a + (Number(i.quantidade) || 0) * (Number(i.valor_unit) || 0), 0);
+  const fretePedido = Number(pedidoHeader.frete) || 0;
+  const totalPedidoForm = subtotalPedido + fretePedido;
+  const totalPecasForm = pedidoItens.reduce((a, i) => a + (Number(i.quantidade) || 0), 0);
+
+  const addItem = () => setPedidoItens(prev => [...prev, { ...emptyItem }]);
+  const removeItem = (idx) => setPedidoItens(prev => prev.filter((_, i) => i !== idx));
+  const updateItem = (idx, field, value) => setPedidoItens(prev => prev.map((it, i) => i === idx ? { ...it, [field]: value } : it));
+
   const getProdEstoque = (compra) => {
-    if (compra.produto_nome && compra.tamanho) {
+    if (compra.produto_nome && compra.tamanho)
       return produtos.find(p => p.nome === compra.produto_nome && p.tamanho === compra.tamanho);
-    }
     return produtos.find(p => `${p.nome} ${p.tamanho}` === compra.produto || p.nome === compra.produto);
   };
 
-  // Calcula quantas unidades ainda estão em estoque vs quantas já foram vendidas
   const calcImpacto = (compra) => {
     const prod = getProdEstoque(compra);
     const qtdCompra = Number(compra.quantidade);
     const estoqueAtual = Number(prod?.quantidade ?? 0);
-    const jaVendido = Math.max(0, qtdCompra - estoqueAtual);
-    const podeRemover = Math.min(qtdCompra, estoqueAtual);
-    return { prod, jaVendido, podeRemover, qtdCompra, estoqueAtual };
+    return { prod, jaVendido: Math.max(0, qtdCompra - estoqueAtual), podeRemover: Math.min(qtdCompra, estoqueAtual), qtdCompra, estoqueAtual };
   };
 
   const salvarForn = async () => {
@@ -1102,58 +1118,98 @@ function Fornecedores() {
     try { await addForn(formF); setModalForn(false); setFormF(emptyF); } finally { setSaving(false); }
   };
 
-  const salvarCompra = async () => {
-    if (!formC.fornecedor || !formC.produto_nome || !formC.quantidade || !formC.valor_unit) return;
+  const fecharModalCompra = () => {
+    setModalCompra(false);
+    setPedidoItens([{ ...emptyItem }]);
+    setPedidoHeader(emptyHeader);
+  };
+
+  const salvarPedido = async () => {
+    const itensValidos = pedidoItens.filter(i => i.produto_nome && i.quantidade && i.valor_unit);
+    if (!pedidoHeader.fornecedor || itensValidos.length === 0) return;
     setSaving(true);
     try {
-      const qtd = Number(formC.quantidade), vunit = Number(formC.valor_unit), frete = Number(formC.frete || 0);
-      const total = qtd * vunit + frete;
-      const nomeProduto = `${formC.produto_nome} ${formC.tamanho}`.trim();
+      for (const item of itensValidos) {
+        const itemSubtotal = Number(item.quantidade) * Number(item.valor_unit);
+        const freteRateado = subtotalPedido > 0 ? (itemSubtotal / subtotalPedido) * fretePedido : 0;
+        const total = itemSubtotal + freteRateado;
+        const custoReal = total / Number(item.quantidade);
 
-      await addCompra({ ...formC, produto: nomeProduto, quantidade: qtd, valor_unit: vunit, frete, total });
+        await addCompra({
+          fornecedor: pedidoHeader.fornecedor,
+          produto: `${item.produto_nome} ${item.tamanho}`.trim(),
+          produto_nome: item.produto_nome,
+          tamanho: item.tamanho,
+          quantidade: Number(item.quantidade),
+          valor_unit: Number(item.valor_unit),
+          frete: freteRateado,
+          total,
+          data: pedidoHeader.data,
+          prazo_entrega: pedidoHeader.prazo_entrega,
+          status: "Pedido realizado",
+        });
 
-      const prodEstoque = produtos.find(p => p.nome === formC.produto_nome && p.tamanho === formC.tamanho);
-      if (prodEstoque) {
-        await db.update("produtos", prodEstoque.id, { quantidade: Number(prodEstoque.quantidade) + qtd, custo: vunit });
-        reloadProdutos();
+        const prod = produtos.find(p => p.nome === item.produto_nome && p.tamanho === item.tamanho);
+        if (prod) {
+          await db.update("produtos", prod.id, {
+            quantidade: Number(prod.quantidade) + Number(item.quantidade),
+            custo: custoReal,
+          });
+        }
       }
-
-      setModalCompra(false);
-      setFormC(emptyC);
+      await reloadProdutos();
+      fecharModalCompra();
     } finally { setSaving(false); }
   };
 
-  const abrirCancelar = (compra) => {
-    if (compra.status === "Cancelado") return;
-    setModalConfirm({ tipo: "cancelar", compra, ...calcImpacto(compra) });
-  };
-
-  const confirmarCancelar = async () => {
+  // Cancelar / excluir item individual
+  const abrirCancelarItem = (c) => { if (c.status !== "Cancelado") setModalConfirm({ tipo: "cancelar", compra: c, ...calcImpacto(c) }); };
+  const confirmarCancelarItem = async () => {
     const { compra, prod, podeRemover } = modalConfirm;
     setSaving(true);
     try {
       await editCompra(compra.id, { status: "Cancelado" });
-      if (prod && podeRemover > 0) {
-        await db.update("produtos", prod.id, { quantidade: Number(prod.quantidade) - podeRemover });
-        reloadProdutos();
-      }
+      if (prod && podeRemover > 0) { await db.update("produtos", prod.id, { quantidade: Number(prod.quantidade) - podeRemover }); await reloadProdutos(); }
+      setModalConfirm(null);
+    } finally { setSaving(false); }
+  };
+  const abrirExcluirItem = (c) => setModalConfirm({ tipo: "excluir", compra: c, ...calcImpacto(c) });
+  const confirmarExcluirItem = async () => {
+    const { compra, prod, podeRemover } = modalConfirm;
+    setSaving(true);
+    try {
+      if (compra.status !== "Cancelado" && prod && podeRemover > 0) { await db.update("produtos", prod.id, { quantidade: Number(prod.quantidade) - podeRemover }); await reloadProdutos(); }
+      await removeCompra(compra.id);
       setModalConfirm(null);
     } finally { setSaving(false); }
   };
 
-  const abrirExcluir = (compra) => {
-    setModalConfirm({ tipo: "excluir", compra, ...calcImpacto(compra) });
-  };
-
-  const confirmarExcluir = async () => {
-    const { compra, prod, podeRemover } = modalConfirm;
+  // Cancelar / excluir pedido inteiro
+  const abrirCancelarPedido = (itens) => setModalConfirm({ tipo: "cancelar_pedido", itens });
+  const confirmarCancelarPedido = async () => {
     setSaving(true);
     try {
-      if (compra.status !== "Cancelado" && prod && podeRemover > 0) {
-        await db.update("produtos", prod.id, { quantidade: Number(prod.quantidade) - podeRemover });
-        reloadProdutos();
+      for (const c of modalConfirm.itens.filter(x => x.status !== "Cancelado")) {
+        await editCompra(c.id, { status: "Cancelado" });
+        const { prod, podeRemover } = calcImpacto(c);
+        if (prod && podeRemover > 0) await db.update("produtos", prod.id, { quantidade: Number(prod.quantidade) - podeRemover });
       }
-      await removeCompra(compra.id);
+      await reloadProdutos();
+      setModalConfirm(null);
+    } finally { setSaving(false); }
+  };
+  const abrirExcluirPedido = (itens) => setModalConfirm({ tipo: "excluir_pedido", itens });
+  const confirmarExcluirPedido = async () => {
+    setSaving(true);
+    try {
+      for (const c of modalConfirm.itens) {
+        if (c.status !== "Cancelado") {
+          const { prod, podeRemover } = calcImpacto(c);
+          if (prod && podeRemover > 0) await db.update("produtos", prod.id, { quantidade: Number(prod.quantidade) - podeRemover });
+        }
+        await removeCompra(c.id);
+      }
+      await reloadProdutos();
       setModalConfirm(null);
     } finally { setSaving(false); }
   };
@@ -1196,42 +1252,80 @@ function Fornecedores() {
 
       {aba === "compras" && (
         <>
-          <SectionHeader title="Histórico de Compras" action={<Btn onClick={() => setModalCompra(true)}>+ Registrar Compra</Btn>} />
-          <div style={S.card}>
-            <Table
-              cols={[
-                { key: "data", label: "Data" },
-                { key: "fornecedor", label: "Fornecedor" },
-                { key: "produto", label: "Produto" },
-                { key: "tamanho", label: "Tam." },
-                { key: "quantidade", label: "Qtd", align: "center" },
-                { key: "valor_unit", label: "Unit.", align: "right", render: v => fmt(v) },
-                { key: "total", label: "Total", align: "right", render: (v, r) => (
-                  <span style={{ color: r.status === "Cancelado" ? C.gray : C.yellow, fontWeight: 700, textDecoration: r.status === "Cancelado" ? "line-through" : "none" }}>{fmt(v)}</span>
-                )},
-                { key: "status", label: "Status", render: (v, r) => (
-                  r.status === "Cancelado"
-                    ? <Badge status="Cancelado" />
-                    : <select value={r.status} onChange={e => {
-                        if (e.target.value === "Cancelado") { abrirCancelar(r); }
-                        else { editCompra(r.id, { status: e.target.value }); }
-                      }} style={{ ...S.input, padding: "4px 8px", fontSize: 11, width: "auto" }}>
-                        {["Pedido realizado", "Aguardando envio", "Em trânsito", "Recebido", "Cancelado"].map(s => <option key={s}>{s}</option>)}
-                      </select>
-                )},
-                { key: "id", label: "Ações", render: (v, r) => (
-                  <div style={{ display: "flex", gap: 4 }}>
-                    {r.status !== "Cancelado" && (
-                      <button onClick={() => abrirCancelar(r)} style={{ ...S.btnDanger, padding: "4px 8px", fontSize: 11 }}>✕ Cancelar</button>
-                    )}
-                    <button onClick={() => abrirExcluir(r)} style={{ ...S.btnDanger, padding: "4px 8px", fontSize: 11 }}>🗑</button>
+          <SectionHeader title="Histórico de Pedidos" action={<Btn onClick={() => setModalCompra(true)}>+ Registrar Pedido</Btn>} />
+          {pedidosOrdenados.length === 0
+            ? <div style={{ ...S.card, textAlign: "center", padding: 40, color: C.gray }}>Nenhuma compra registrada.</div>
+            : pedidosOrdenados.map(([key, itens]) => {
+              const aberto = expandido[key];
+              const totalPed = itens.reduce((a, c) => a + Number(c.total || 0), 0);
+              const cancelados = itens.every(c => c.status === "Cancelado");
+              const parcialCanc = !cancelados && itens.some(c => c.status === "Cancelado");
+              const [forn, dataPed] = key.split("|");
+              const statusRef = cancelados ? "Cancelado" : itens.find(c => c.status !== "Cancelado")?.status || itens[0]?.status;
+              return (
+                <div key={key} style={{ ...S.card, marginBottom: 12, opacity: cancelados ? 0.65 : 1 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                    <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                      <span style={{ fontWeight: 800, color: C.white, fontSize: 14 }}>{forn}</span>
+                      <span style={{ fontSize: 12, color: C.gray }}>{dataPed}</span>
+                      <Badge status={statusRef} />
+                      {parcialCanc && <span style={{ fontSize: 11, color: C.warn }}>parcialmente cancelado</span>}
+                      <span style={{ fontSize: 13, color: C.yellow, fontWeight: 700 }}>{fmt(totalPed)}</span>
+                      <span style={{ fontSize: 11, color: C.gray }}>{itens.length} item{itens.length > 1 ? "s" : ""} · {itens.reduce((a, c) => a + Number(c.quantidade || 0), 0)} peças</span>
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      {!cancelados && <button onClick={() => abrirCancelarPedido(itens)} style={{ ...S.btnDanger, padding: "4px 10px", fontSize: 11 }}>✕ Cancelar Tudo</button>}
+                      <button onClick={() => abrirExcluirPedido(itens)} style={{ ...S.btnDanger, padding: "4px 10px", fontSize: 11 }}>🗑 Excluir Tudo</button>
+                      <button onClick={() => setExpandido(e => ({ ...e, [key]: !e[key] }))} style={{ ...S.btnGhost, padding: "4px 10px", fontSize: 11 }}>{aberto ? "▲ Fechar" : "▼ Ver Itens"}</button>
+                    </div>
                   </div>
-                )},
-              ]}
-              rows={compras}
-              emptyMsg="Nenhuma compra registrada."
-            />
-          </div>
+                  {aberto && (
+                    <div style={{ marginTop: 14, borderTop: `1px solid ${C.border}`, paddingTop: 14, overflowX: "auto" }}>
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                        <thead>
+                          <tr>{["Produto", "Tam.", "Qtd", "Unit.", "Frete Rat.", "Total", "Custo/un", "Status", ""].map(h => (
+                            <th key={h} style={{ ...S.label, textAlign: "left", padding: "0 8px 8px", whiteSpace: "nowrap" }}>{h}</th>
+                          ))}</tr>
+                        </thead>
+                        <tbody>
+                          {itens.map(c => {
+                            const custoUnit = Number(c.quantidade) > 0 ? Number(c.total) / Number(c.quantidade) : 0;
+                            return (
+                              <tr key={c.id} style={{ borderTop: `1px solid ${C.border}`, opacity: c.status === "Cancelado" ? 0.5 : 1 }}>
+                                <td style={{ padding: "8px", color: C.text }}>{c.produto_nome || c.produto}</td>
+                                <td style={{ padding: "8px", color: C.text }}>{c.tamanho}</td>
+                                <td style={{ padding: "8px", color: C.text, textAlign: "center" }}>{c.quantidade}</td>
+                                <td style={{ padding: "8px", color: C.text }}>{fmt(c.valor_unit)}</td>
+                                <td style={{ padding: "8px", color: C.gray }}>{fmt(c.frete)}</td>
+                                <td style={{ padding: "8px", color: c.status === "Cancelado" ? C.gray : C.yellow, fontWeight: 700, textDecoration: c.status === "Cancelado" ? "line-through" : "none" }}>{fmt(c.total)}</td>
+                                <td style={{ padding: "8px", color: C.success }}>{fmt(custoUnit)}</td>
+                                <td style={{ padding: "8px" }}>
+                                  {c.status === "Cancelado" ? <Badge status="Cancelado" /> : (
+                                    <select value={c.status} onChange={e => {
+                                      if (e.target.value === "Cancelado") abrirCancelarItem(c);
+                                      else editCompra(c.id, { status: e.target.value });
+                                    }} style={{ ...S.input, padding: "3px 6px", fontSize: 11, width: "auto" }}>
+                                      {["Pedido realizado", "Aguardando envio", "Em trânsito", "Recebido", "Cancelado"].map(s => <option key={s}>{s}</option>)}
+                                    </select>
+                                  )}
+                                </td>
+                                <td style={{ padding: "8px" }}>
+                                  <div style={{ display: "flex", gap: 4 }}>
+                                    {c.status !== "Cancelado" && <button onClick={() => abrirCancelarItem(c)} style={{ ...S.btnDanger, padding: "3px 7px", fontSize: 10 }}>✕</button>}
+                                    <button onClick={() => abrirExcluirItem(c)} style={{ ...S.btnDanger, padding: "3px 7px", fontSize: 10 }}>🗑</button>
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          }
         </>
       )}
 
@@ -1251,99 +1345,147 @@ function Fornecedores() {
         </Modal>
       )}
 
+      {/* Modal: Registrar Pedido Multi-Item */}
       {modalCompra && (
-        <Modal title="Registrar Compra" onClose={() => setModalCompra(false)}>
-          <Field label="Fornecedor">
-            <Select value={formC.fornecedor} onChange={e => setFormC({ ...formC, fornecedor: e.target.value })}
-              options={[{ value: "", label: "Selecione..." }, ...fornecedores.map(f => ({ value: f.nome, label: f.nome }))]} />
-          </Field>
-          <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 10 }}>
-            <Field label="Produto">
-              <Input list="compra-produtos-list" value={formC.produto_nome} onChange={e => setFormC({ ...formC, produto_nome: e.target.value, tamanho: "M" })} placeholder="Nome do produto" />
-              <datalist id="compra-produtos-list">{produtosUnicos.map(n => <option key={n} value={n} />)}</datalist>
-            </Field>
-            <Field label="Tamanho">
-              <Select value={formC.tamanho} onChange={e => setFormC({ ...formC, tamanho: e.target.value })}
-                options={tamanhosPorProduto.length > 0 ? tamanhosPorProduto : ["PP", "P", "M", "G", "GG", "2GG", "3GG", "4GG"]} />
-            </Field>
+        <Modal title="Registrar Pedido de Compra" onClose={fecharModalCompra}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
+            <div style={{ gridColumn: "1/-1" }}>
+              <Field label="Fornecedor">
+                <Select value={pedidoHeader.fornecedor} onChange={e => setPedidoHeader({ ...pedidoHeader, fornecedor: e.target.value })}
+                  options={[{ value: "", label: "Selecione o fornecedor..." }, ...fornecedores.map(f => ({ value: f.nome, label: f.nome }))]} />
+              </Field>
+            </div>
+            <Field label="Data da Compra"><Input type="date" value={pedidoHeader.data} onChange={e => setPedidoHeader({ ...pedidoHeader, data: e.target.value })} /></Field>
+            <Field label="Prazo de Entrega"><Input type="date" value={pedidoHeader.prazo_entrega} onChange={e => setPedidoHeader({ ...pedidoHeader, prazo_entrega: e.target.value })} /></Field>
+            <div style={{ gridColumn: "1/-1" }}>
+              <Field label="Frete Total (R$)"><Input type="number" value={pedidoHeader.frete} onChange={e => setPedidoHeader({ ...pedidoHeader, frete: e.target.value })} placeholder="0,00 — será rateado entre os itens" /></Field>
+            </div>
           </div>
-          {formC.produto_nome && !produtos.find(p => p.nome === formC.produto_nome && p.tamanho === formC.tamanho) && (
-            <div style={{ background: C.warnBg, borderRadius: 8, padding: "8px 12px", fontSize: 12, color: C.warn, marginBottom: 10 }}>
-              ⚠️ Produto não encontrado no estoque. Cadastre-o primeiro em Estoque para que a quantidade seja atualizada automaticamente.
+
+          <div style={{ ...S.label, marginBottom: 10 }}>Itens do Pedido</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
+            {pedidoItens.map((item, idx) => {
+              const tamOpts = item.produto_nome ? produtos.filter(p => p.nome === item.produto_nome).map(p => p.tamanho) : [];
+              const itemSub = (Number(item.quantidade) || 0) * (Number(item.valor_unit) || 0);
+              const freteRat = subtotalPedido > 0 ? (itemSub / subtotalPedido) * fretePedido : 0;
+              const custoUn = Number(item.quantidade) > 0 ? (itemSub + freteRat) / Number(item.quantidade) : 0;
+              const noEstoque = !!produtos.find(p => p.nome === item.produto_nome && p.tamanho === item.tamanho);
+
+              return (
+                <div key={idx} style={{ background: "#0d0d0d", border: `1px solid ${C.border}`, borderRadius: 8, padding: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: C.gray }}>ITEM {idx + 1}</span>
+                    {pedidoItens.length > 1 && <button onClick={() => removeItem(idx)} style={{ background: "none", border: "none", color: C.danger, cursor: "pointer", fontSize: 15, lineHeight: 1 }}>✕</button>}
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr", gap: 8 }}>
+                    <div>
+                      <div style={{ ...S.label, marginBottom: 4 }}>Produto</div>
+                      <Input list={`pl-${idx}`} value={item.produto_nome} onChange={e => updateItem(idx, "produto_nome", e.target.value)} placeholder="Nome do produto" />
+                      <datalist id={`pl-${idx}`}>{produtosUnicos.map(n => <option key={n} value={n} />)}</datalist>
+                    </div>
+                    <div>
+                      <div style={{ ...S.label, marginBottom: 4 }}>Tamanho</div>
+                      <Select value={item.tamanho} onChange={e => updateItem(idx, "tamanho", e.target.value)}
+                        options={tamOpts.length > 0 ? tamOpts : ["PP", "P", "M", "G", "GG", "2GG", "3GG", "4GG"]} />
+                    </div>
+                    <div>
+                      <div style={{ ...S.label, marginBottom: 4 }}>Qtd</div>
+                      <Input type="number" value={item.quantidade} onChange={e => updateItem(idx, "quantidade", e.target.value)} />
+                    </div>
+                    <div>
+                      <div style={{ ...S.label, marginBottom: 4 }}>Unit. (R$)</div>
+                      <Input type="number" value={item.valor_unit} onChange={e => updateItem(idx, "valor_unit", e.target.value)} />
+                    </div>
+                  </div>
+                  {itemSub > 0 && (
+                    <div style={{ marginTop: 8, fontSize: 11, color: C.gray, display: "flex", gap: 12, flexWrap: "wrap" }}>
+                      <span>Subtotal: <strong style={{ color: C.yellow }}>{fmt(itemSub)}</strong></span>
+                      {fretePedido > 0 && <><span>Frete rat.: <strong>{fmt(freteRat)}</strong></span><span>Custo/un: <strong style={{ color: C.success }}>{fmt(custoUn)}</strong></span></>}
+                      {item.produto_nome && <span style={{ color: noEstoque ? C.success : C.warn }}>{noEstoque ? "✅ estoque será atualizado" : "⚠️ produto não encontrado no estoque"}</span>}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          <button onClick={addItem} style={{ ...S.btnGhost, width: "100%", marginBottom: 16, fontSize: 13, padding: "10px" }}>+ Adicionar Item</button>
+
+          {subtotalPedido > 0 && (
+            <div style={{ background: C.yellowBg, border: `1px solid ${C.yellow}33`, borderRadius: 8, padding: 14, marginBottom: 16 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "6px 20px", fontSize: 13 }}>
+                <span style={{ color: C.textMuted }}>Subtotal produtos</span><span style={{ color: C.text, textAlign: "right" }}>{fmt(subtotalPedido)}</span>
+                <span style={{ color: C.textMuted }}>Frete</span><span style={{ color: C.text, textAlign: "right" }}>{fmt(fretePedido)}</span>
+                <span style={{ color: C.textMuted }}>Total de peças</span><span style={{ color: C.text, textAlign: "right" }}>{totalPecasForm} un.</span>
+                <span style={{ color: C.yellow, fontWeight: 800 }}>Total geral</span><span style={{ color: C.yellow, fontWeight: 800, textAlign: "right" }}>{fmt(totalPedidoForm)}</span>
+              </div>
             </div>
           )}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
-            <Field label="Qtd"><Input type="number" value={formC.quantidade} onChange={e => setFormC({ ...formC, quantidade: e.target.value })} /></Field>
-            <Field label="Valor unit. (R$)"><Input type="number" value={formC.valor_unit} onChange={e => setFormC({ ...formC, valor_unit: e.target.value })} /></Field>
-            <Field label="Frete (R$)"><Input type="number" value={formC.frete} onChange={e => setFormC({ ...formC, frete: e.target.value })} /></Field>
-          </div>
-          {formC.quantidade && formC.valor_unit && (
-            <div style={{ background: C.yellowBg, borderRadius: 8, padding: "10px 14px", fontSize: 13, color: C.yellow, marginBottom: 12 }}>
-              Total: {fmt(Number(formC.quantidade) * Number(formC.valor_unit) + Number(formC.frete || 0))}
-              {produtos.find(p => p.nome === formC.produto_nome && p.tamanho === formC.tamanho) && (
-                <span style={{ marginLeft: 12, fontSize: 11, color: C.success }}>✅ Estoque será atualizado automaticamente</span>
-              )}
-            </div>
-          )}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-            <Field label="Data"><Input type="date" value={formC.data} onChange={e => setFormC({ ...formC, data: e.target.value })} /></Field>
-            <Field label="Prazo entrega"><Input type="date" value={formC.prazo_entrega} onChange={e => setFormC({ ...formC, prazo_entrega: e.target.value })} /></Field>
-          </div>
+
           <div style={{ display: "flex", gap: 10 }}>
-            <Btn onClick={salvarCompra} disabled={saving}>{saving ? "Salvando..." : "Registrar Compra"}</Btn>
-            <Btn ghost onClick={() => setModalCompra(false)}>Cancelar</Btn>
+            {(() => {
+              const validos = pedidoItens.filter(i => i.produto_nome && i.quantidade && i.valor_unit).length;
+              return <Btn onClick={salvarPedido} disabled={saving || !pedidoHeader.fornecedor || validos === 0}>{saving ? "Salvando..." : `Registrar Pedido — ${validos} item${validos !== 1 ? "s" : ""}`}</Btn>;
+            })()}
+            <Btn ghost onClick={fecharModalCompra}>Cancelar</Btn>
           </div>
         </Modal>
       )}
 
+      {/* Modal: Confirmação de cancelamento/exclusão */}
       {modalConfirm && (() => {
-        const { tipo, compra, prod, jaVendido, podeRemover, qtdCompra, estoqueAtual } = modalConfirm;
-        const titulo = tipo === "cancelar" ? "Cancelar Compra" : "Excluir Compra";
-        const isExcluirCancelada = tipo === "excluir" && compra.status === "Cancelado";
-        return (
-          <Modal title={titulo} onClose={() => setModalConfirm(null)}>
-            <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: 14, marginBottom: 14, fontSize: 13 }}>
-              <div style={{ fontWeight: 700, color: C.white, marginBottom: 4 }}>{compra.produto}{compra.tamanho && compra.produto_nome ? ` ${compra.tamanho}` : ""}</div>
-              <div style={{ color: C.gray, fontSize: 12, marginBottom: 10 }}>Fornecedor: {compra.fornecedor} · Data: {compra.data} · {fmt(compra.total)}</div>
-              {!isExcluirCancelada && (
-                <>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12 }}>
-                    <div>📦 Quantidade comprada: <strong style={{ color: C.white }}>{qtdCompra} un.</strong></div>
-                    <div>🏬 Estoque atual: <strong style={{ color: estoqueAtual > 0 ? C.success : C.danger }}>{prod ? `${estoqueAtual} un.` : "Produto não encontrado no estoque"}</strong></div>
-                    {jaVendido > 0 && <div style={{ color: C.warn }}>🛍️ Já foram vendidas: <strong>{jaVendido} un.</strong> (histórico de vendas mantido)</div>}
-                    <div style={{ color: C.success, fontWeight: 700 }}>✅ Serão removidas do estoque: {podeRemover} un.</div>
-                  </div>
-                  {jaVendido > 0 && (
-                    <div style={{ background: C.warnBg, border: `1px solid ${C.warn}44`, borderRadius: 6, padding: "8px 12px", marginTop: 10, fontSize: 12, color: C.warn }}>
-                      ⚠️ {jaVendido} unidade{jaVendido > 1 ? "s foram" : " foi"} vendida{jaVendido > 1 ? "s" : ""} e não {jaVendido > 1 ? "serão removidas" : "será removida"} do histórico. Apenas as {podeRemover} unidades restantes em estoque serão estornadas.
-                    </div>
-                  )}
-                  {!prod && (
-                    <div style={{ background: C.infoBg, borderRadius: 6, padding: "8px 12px", marginTop: 10, fontSize: 12, color: C.info }}>
-                      ℹ️ Produto não localizado no estoque. Nenhuma alteração será feita no estoque, apenas no registro da compra.
-                    </div>
-                  )}
-                </>
-              )}
-              {isExcluirCancelada && (
-                <div style={{ fontSize: 12, color: C.gray }}>Esta compra já está cancelada e não impacta o estoque. Será removida permanentemente do histórico.</div>
-              )}
-            </div>
-            {tipo === "cancelar" && (
-              <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 14 }}>
-                O registro ficará visível no histórico com status <strong>Cancelado</strong> e não contará para relatórios ou custo ativo.
+        const isPedido = modalConfirm.tipo === "cancelar_pedido" || modalConfirm.tipo === "excluir_pedido";
+        const isExcluir = modalConfirm.tipo.startsWith("excluir");
+
+        if (isPedido) {
+          const { itens } = modalConfirm;
+          const ativas = itens.filter(c => c.status !== "Cancelado");
+          const totalUnsold = ativas.reduce((a, c) => a + calcImpacto(c).podeRemover, 0);
+          return (
+            <Modal title={isExcluir ? "Excluir Pedido Inteiro" : "Cancelar Pedido Inteiro"} onClose={() => setModalConfirm(null)}>
+              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: 14, marginBottom: 14, fontSize: 13 }}>
+                <div style={{ fontWeight: 700, color: C.white, marginBottom: 4 }}>{itens[0]?.fornecedor} · {itens[0]?.data}</div>
+                <div style={{ color: C.gray, fontSize: 12, marginBottom: 10 }}>{itens.length} item{itens.length > 1 ? "s" : ""} · {fmt(itens.reduce((a, c) => a + Number(c.total || 0), 0))}</div>
+                <div style={{ fontSize: 12, color: C.success }}>✅ Serão removidas do estoque: <strong>{totalUnsold} unidades</strong> (apenas as ainda disponíveis)</div>
               </div>
-            )}
-            {tipo === "excluir" && !isExcluirCancelada && (
-              <div style={{ background: C.dangerBg, border: `1px solid ${C.danger}44`, borderRadius: 6, padding: "8px 12px", marginBottom: 14, fontSize: 12, color: C.danger }}>
-                🗑️ A exclusão é permanente. O registro será apagado completamente do sistema.
-              </div>
-            )}
-            <div style={{ display: "flex", gap: 10 }}>
-              {tipo === "cancelar"
-                ? <button onClick={confirmarCancelar} disabled={saving} style={{ ...S.btnDanger, padding: "10px 20px", fontSize: 13, fontWeight: 800 }}>{saving ? "Cancelando..." : "✕ Confirmar Cancelamento"}</button>
-                : <button onClick={confirmarExcluir} disabled={saving} style={{ ...S.btnDanger, padding: "10px 20px", fontSize: 13, fontWeight: 800 }}>{saving ? "Excluindo..." : "🗑 Confirmar Exclusão"}</button>
+              {isExcluir
+                ? <div style={{ background: C.dangerBg, border: `1px solid ${C.danger}44`, borderRadius: 6, padding: "8px 12px", marginBottom: 14, fontSize: 12, color: C.danger }}>🗑️ Exclusão permanente — todos os {itens.length} itens serão removidos do histórico.</div>
+                : <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 14 }}>Os registros ficam no histórico com status <strong>Cancelado</strong> e não contam para relatórios.</div>
               }
+              <div style={{ display: "flex", gap: 10 }}>
+                <button onClick={isExcluir ? confirmarExcluirPedido : confirmarCancelarPedido} disabled={saving} style={{ ...S.btnDanger, padding: "10px 20px", fontSize: 13, fontWeight: 800 }}>
+                  {saving ? "Processando..." : isExcluir ? "🗑 Confirmar Exclusão" : "✕ Confirmar Cancelamento"}
+                </button>
+                <Btn ghost onClick={() => setModalConfirm(null)}>Voltar</Btn>
+              </div>
+            </Modal>
+          );
+        }
+
+        const { compra, prod, jaVendido, podeRemover, qtdCompra, estoqueAtual } = modalConfirm;
+        const isExcCancelada = isExcluir && compra.status === "Cancelado";
+        return (
+          <Modal title={isExcluir ? "Excluir Item" : "Cancelar Item"} onClose={() => setModalConfirm(null)}>
+            <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: 14, marginBottom: 14, fontSize: 13 }}>
+              <div style={{ fontWeight: 700, color: C.white, marginBottom: 4 }}>{compra.produto_nome || compra.produto} {compra.tamanho}</div>
+              <div style={{ color: C.gray, fontSize: 12, marginBottom: 10 }}>{compra.fornecedor} · {compra.data} · {fmt(compra.total)}</div>
+              {!isExcCancelada && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 5, fontSize: 12 }}>
+                  <div>📦 Comprado: <strong style={{ color: C.white }}>{qtdCompra} un.</strong></div>
+                  <div>🏬 Estoque atual: <strong style={{ color: estoqueAtual > 0 ? C.success : C.danger }}>{prod ? `${estoqueAtual} un.` : "produto não encontrado"}</strong></div>
+                  {jaVendido > 0 && <div style={{ color: C.warn }}>🛍️ Já vendidas: <strong>{jaVendido} un.</strong> (histórico preservado)</div>}
+                  <div style={{ color: C.success, fontWeight: 700 }}>✅ Serão removidas: {podeRemover} un.</div>
+                  {jaVendido > 0 && <div style={{ background: C.warnBg, borderRadius: 6, padding: "6px 10px", marginTop: 4, color: C.warn }}>⚠️ {jaVendido} un. já vendidas não serão afetadas.</div>}
+                </div>
+              )}
+              {isExcCancelada && <div style={{ fontSize: 12, color: C.gray }}>Compra já cancelada — apenas o registro será removido do histórico.</div>}
+            </div>
+            {isExcluir && !isExcCancelada && <div style={{ background: C.dangerBg, border: `1px solid ${C.danger}44`, borderRadius: 6, padding: "8px 12px", marginBottom: 14, fontSize: 12, color: C.danger }}>🗑️ A exclusão é permanente.</div>}
+            {!isExcluir && <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 14 }}>O registro ficará no histórico como <strong>Cancelado</strong> sem afetar relatórios.</div>}
+            <div style={{ display: "flex", gap: 10 }}>
+              <button onClick={isExcluir ? confirmarExcluirItem : confirmarCancelarItem} disabled={saving} style={{ ...S.btnDanger, padding: "10px 20px", fontSize: 13, fontWeight: 800 }}>
+                {saving ? "Processando..." : isExcluir ? "🗑 Confirmar Exclusão" : "✕ Confirmar Cancelamento"}
+              </button>
               <Btn ghost onClick={() => setModalConfirm(null)}>Voltar</Btn>
             </div>
           </Modal>
