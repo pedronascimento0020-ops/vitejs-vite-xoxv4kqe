@@ -452,11 +452,11 @@ function Produtos() {
 // ============================================================
 function Vendas() {
   const { rows, loading, add } = useTable("vendas");
-  const { rows: produtos } = useTable("produtos", "nome.asc");
+  const { rows: produtos, reload: reloadProdutos } = useTable("produtos", "nome.asc");
   const { rows: clientes } = useTable("clientes", "nome.asc");
   const [modal, setModal] = useState(false);
   const [saving, setSaving] = useState(false);
-  const empty = { cliente_nome: "", produto_nome: "", tamanho: "M", quantidade: 1, valor: "", custo: "", desconto: 0, frete: 0, forma_pagamento: "PIX", data: today(), obs: "" };
+  const empty = { cliente_nome: "", produto_nome: "", tamanho: "", quantidade: 1, valor: "", custo: "", desconto: 0, frete: 0, forma_pagamento: "PIX", data: today(), obs: "" };
   const [form, setForm] = useState(empty);
 
   const fat = rows.reduce((a, v) => a + Number(v.valor || 0), 0);
@@ -464,15 +464,43 @@ function Vendas() {
   const ticket = rows.length > 0 ? fat / rows.length : 0;
   const margem = fat > 0 ? (lucro / fat) * 100 : 0;
 
-  const prodSelecionado = produtos.find(p => p.nome === form.produto_nome);
+  // Produtos únicos (sem duplicar por tamanho)
+  const nomesUnicos = [...new Set(produtos.map(p => p.nome))].sort();
+
+  // Tamanhos disponíveis em estoque para o produto selecionado
+  const tamanhosDisponiveis = form.produto_nome
+    ? produtos.filter(p => p.nome === form.produto_nome && Number(p.quantidade) > 0).map(p => p.tamanho)
+    : [];
+
+  // Produto específico (nome + tamanho) selecionado
+  const produtoEscolhido = produtos.find(p => p.nome === form.produto_nome && p.tamanho === form.tamanho);
+
+  const selecionarProduto = (nome) => {
+    const tamanhosComEstoque = produtos.filter(p => p.nome === nome && Number(p.quantidade) > 0);
+    const primeiro = tamanhosComEstoque[0];
+    setForm({ ...form, produto_nome: nome, tamanho: primeiro?.tamanho || "", custo: primeiro?.custo || "", valor: primeiro?.preco || "" });
+  };
+
+  const selecionarTamanho = (tam) => {
+    const prod = produtos.find(p => p.nome === form.produto_nome && p.tamanho === tam);
+    setForm({ ...form, tamanho: tam, custo: prod?.custo || form.custo, valor: prod?.preco || form.valor });
+  };
 
   const salvar = async () => {
     if (!form.cliente_nome || !form.produto_nome || !form.valor) return;
     setSaving(true);
     try {
-      const custo = Number(form.custo) || Number(prodSelecionado?.custo) || 0;
+      const custo = Number(form.custo) || Number(produtoEscolhido?.custo) || 0;
       const lucroCalc = Number(form.valor) - custo - Number(form.desconto || 0);
       await add({ ...form, valor: Number(form.valor), custo, lucro: lucroCalc, desconto: Number(form.desconto || 0), frete: Number(form.frete || 0), quantidade: Number(form.quantidade) });
+
+      // Baixa no estoque
+      if (produtoEscolhido) {
+        const novaQtd = Math.max(0, Number(produtoEscolhido.quantidade) - Number(form.quantidade));
+        await db.update("produtos", produtoEscolhido.id, { quantidade: novaQtd });
+        reloadProdutos();
+      }
+
       setModal(false);
       setForm(empty);
     } finally { setSaving(false); }
@@ -495,6 +523,7 @@ function Vendas() {
             { key: "data", label: "Data" },
             { key: "cliente_nome", label: "Cliente" },
             { key: "produto_nome", label: "Produto" },
+            { key: "tamanho", label: "Tam." },
             { key: "forma_pagamento", label: "Pgto", render: v => <Badge status={v} /> },
             { key: "valor", label: "Valor", align: "right", render: v => fmt(v) },
             { key: "custo", label: "Custo", align: "right", render: v => fmt(v) },
@@ -511,18 +540,34 @@ function Vendas() {
             <Input list="clientes-list" value={form.cliente_nome} onChange={e => setForm({ ...form, cliente_nome: e.target.value })} placeholder="Nome do cliente" />
             <datalist id="clientes-list">{clientes.map(c => <option key={c.id} value={c.nome} />)}</datalist>
           </Field>
+
+          {/* Passo 1: selecionar produto */}
           <Field label="Produto">
-            <Input list="produtos-list" value={form.produto_nome} onChange={e => {
-              const p = produtos.find(x => x.nome === e.target.value);
-              setForm({ ...form, produto_nome: e.target.value, custo: p?.custo || form.custo, tamanho: p?.tamanho || form.tamanho, valor: p?.preco || form.valor });
-            }} placeholder="Nome do produto" />
-            <datalist id="produtos-list">{produtos.map(p => <option key={p.id} value={p.nome} />)}</datalist>
+            <Input list="produtos-unicos-list" value={form.produto_nome} onChange={e => selecionarProduto(e.target.value)} placeholder="Buscar produto..." />
+            <datalist id="produtos-unicos-list">{nomesUnicos.map(n => <option key={n} value={n} />)}</datalist>
           </Field>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
-            <Field label="Tamanho"><Select value={form.tamanho} onChange={e => setForm({ ...form, tamanho: e.target.value })} options={["PP", "P", "M", "G", "GG", "2GG", "3GG", "4GG"]} /></Field>
-            <Field label="Qtd"><Input type="number" value={form.quantidade} onChange={e => setForm({ ...form, quantidade: e.target.value })} /></Field>
-            <Field label="Valor (R$)"><Input type="number" value={form.valor} onChange={e => setForm({ ...form, valor: e.target.value })} /></Field>
-          </div>
+
+          {/* Passo 2: tamanho aparece após selecionar produto */}
+          {form.produto_nome && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+              <Field label="Tamanho">
+                {tamanhosDisponiveis.length > 0
+                  ? <Select value={form.tamanho} onChange={e => selecionarTamanho(e.target.value)} options={tamanhosDisponiveis} />
+                  : <div style={{ color: C.danger, fontSize: 12, padding: "10px 0" }}>⚠️ Sem estoque neste produto</div>
+                }
+              </Field>
+              <Field label="Qtd"><Input type="number" value={form.quantidade} onChange={e => setForm({ ...form, quantidade: e.target.value })} /></Field>
+              <Field label="Valor (R$)"><Input type="number" value={form.valor} onChange={e => setForm({ ...form, valor: e.target.value })} /></Field>
+            </div>
+          )}
+
+          {/* Passo 3: informações preenchidas automaticamente */}
+          {produtoEscolhido && (
+            <div style={{ background: C.successBg, border: `1px solid ${C.success}33`, borderRadius: 8, padding: "10px 14px", fontSize: 12, color: C.text, marginBottom: 10 }}>
+              ✅ <strong>{produtoEscolhido.nome} {produtoEscolhido.tamanho}</strong> · Estoque: {produtoEscolhido.quantidade} un. · Custo: {fmt(produtoEscolhido.custo)}
+            </div>
+          )}
+
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
             <Field label="Custo (R$)"><Input type="number" value={form.custo} onChange={e => setForm({ ...form, custo: e.target.value })} /></Field>
             <Field label="Desconto (R$)"><Input type="number" value={form.desconto} onChange={e => setForm({ ...form, desconto: e.target.value })} /></Field>
@@ -1015,16 +1060,21 @@ function Metas() {
 function Fornecedores() {
   const { rows: fornecedores, loading, add: addForn } = useTable("fornecedores", "nome.asc");
   const { rows: compras, add: addCompra, edit: editCompra } = useTable("compras");
+  const { rows: produtos, reload: reloadProdutos } = useTable("produtos", "nome.asc");
   const [aba, setAba] = useState("fornecedores");
   const [modalForn, setModalForn] = useState(false);
   const [modalCompra, setModalCompra] = useState(false);
   const [saving, setSaving] = useState(false);
   const emptyF = { nome: "", whatsapp: "", instagram: "", cidade: "", prazo: "", obs: "" };
-  const emptyC = { fornecedor: "", produto: "", quantidade: "", valor_unit: "", frete: 0, data: today(), prazo_entrega: "", status: "Pedido realizado" };
+  const emptyC = { fornecedor: "", produto_nome: "", tamanho: "M", quantidade: "", valor_unit: "", frete: 0, data: today(), prazo_entrega: "", status: "Pedido realizado" };
   const [formF, setFormF] = useState(emptyF);
   const [formC, setFormC] = useState(emptyC);
 
   const totalInvestido = compras.reduce((a, c) => a + Number(c.total || 0), 0);
+  const produtosUnicos = [...new Set(produtos.map(p => p.nome))].sort();
+  const tamanhosPorProduto = formC.produto_nome
+    ? produtos.filter(p => p.nome === formC.produto_nome).map(p => p.tamanho)
+    : ["PP", "P", "M", "G", "GG", "2GG", "3GG", "4GG"];
 
   const salvarForn = async () => {
     if (!formF.nome) return;
@@ -1033,11 +1083,25 @@ function Fornecedores() {
   };
 
   const salvarCompra = async () => {
-    if (!formC.fornecedor || !formC.produto) return;
+    if (!formC.fornecedor || !formC.produto_nome || !formC.quantidade || !formC.valor_unit) return;
     setSaving(true);
     try {
       const qtd = Number(formC.quantidade), vunit = Number(formC.valor_unit), frete = Number(formC.frete || 0);
-      await addCompra({ ...formC, quantidade: qtd, valor_unit: vunit, frete, total: qtd * vunit + frete });
+      const total = qtd * vunit + frete;
+      const nomeProduto = `${formC.produto_nome} ${formC.tamanho}`.trim();
+
+      await addCompra({ ...formC, produto: nomeProduto, quantidade: qtd, valor_unit: vunit, frete, total });
+
+      // Atualiza estoque automaticamente
+      const prodEstoque = produtos.find(p => p.nome === formC.produto_nome && p.tamanho === formC.tamanho);
+      if (prodEstoque) {
+        await db.update("produtos", prodEstoque.id, {
+          quantidade: Number(prodEstoque.quantidade) + qtd,
+          custo: vunit,
+        });
+        reloadProdutos();
+      }
+
       setModalCompra(false);
       setFormC(emptyC);
     } finally { setSaving(false); }
@@ -1088,11 +1152,12 @@ function Fornecedores() {
                 { key: "data", label: "Data" },
                 { key: "fornecedor", label: "Fornecedor" },
                 { key: "produto", label: "Produto" },
+                { key: "tamanho", label: "Tam." },
                 { key: "quantidade", label: "Qtd", align: "center" },
                 { key: "valor_unit", label: "Unit.", align: "right", render: v => fmt(v) },
                 { key: "total", label: "Total", align: "right", render: v => <span style={{ color: C.yellow, fontWeight: 700 }}>{fmt(v)}</span> },
                 { key: "status", label: "Status", render: v => <Badge status={v} /> },
-                { key: "id", label: "Status", render: (v, r) => (
+                { key: "id", label: "Atualizar", render: (v, r) => (
                   <select value={r.status} onChange={e => editCompra(v, { status: e.target.value })} style={{ ...S.input, padding: "4px 8px", fontSize: 11, width: "auto" }}>
                     {["Pedido realizado", "Aguardando envio", "Em trânsito", "Recebido", "Cancelado"].map(s => <option key={s}>{s}</option>)}
                   </select>
@@ -1127,7 +1192,21 @@ function Fornecedores() {
             <Select value={formC.fornecedor} onChange={e => setFormC({ ...formC, fornecedor: e.target.value })}
               options={[{ value: "", label: "Selecione..." }, ...fornecedores.map(f => ({ value: f.nome, label: f.nome }))]} />
           </Field>
-          <Field label="Produto"><Input value={formC.produto} onChange={e => setFormC({ ...formC, produto: e.target.value })} /></Field>
+          <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 10 }}>
+            <Field label="Produto">
+              <Input list="compra-produtos-list" value={formC.produto_nome} onChange={e => setFormC({ ...formC, produto_nome: e.target.value, tamanho: "M" })} placeholder="Nome do produto" />
+              <datalist id="compra-produtos-list">{produtosUnicos.map(n => <option key={n} value={n} />)}</datalist>
+            </Field>
+            <Field label="Tamanho">
+              <Select value={formC.tamanho} onChange={e => setFormC({ ...formC, tamanho: e.target.value })}
+                options={tamanhosPorProduto.length > 0 ? tamanhosPorProduto : ["PP", "P", "M", "G", "GG", "2GG", "3GG", "4GG"]} />
+            </Field>
+          </div>
+          {formC.produto_nome && !produtos.find(p => p.nome === formC.produto_nome && p.tamanho === formC.tamanho) && (
+            <div style={{ background: C.warnBg, borderRadius: 8, padding: "8px 12px", fontSize: 12, color: C.warn, marginBottom: 10 }}>
+              ⚠️ Produto não encontrado no estoque. Cadastre-o primeiro em Estoque para que a quantidade seja atualizada automaticamente.
+            </div>
+          )}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
             <Field label="Qtd"><Input type="number" value={formC.quantidade} onChange={e => setFormC({ ...formC, quantidade: e.target.value })} /></Field>
             <Field label="Valor unit. (R$)"><Input type="number" value={formC.valor_unit} onChange={e => setFormC({ ...formC, valor_unit: e.target.value })} /></Field>
@@ -1136,6 +1215,9 @@ function Fornecedores() {
           {formC.quantidade && formC.valor_unit && (
             <div style={{ background: C.yellowBg, borderRadius: 8, padding: "10px 14px", fontSize: 13, color: C.yellow, marginBottom: 12 }}>
               Total: {fmt(Number(formC.quantidade) * Number(formC.valor_unit) + Number(formC.frete || 0))}
+              {produtos.find(p => p.nome === formC.produto_nome && p.tamanho === formC.tamanho) && (
+                <span style={{ marginLeft: 12, fontSize: 11, color: C.success }}>✅ Estoque será atualizado automaticamente</span>
+              )}
             </div>
           )}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
@@ -1143,7 +1225,7 @@ function Fornecedores() {
             <Field label="Prazo entrega"><Input type="date" value={formC.prazo_entrega} onChange={e => setFormC({ ...formC, prazo_entrega: e.target.value })} /></Field>
           </div>
           <div style={{ display: "flex", gap: 10 }}>
-            <Btn onClick={salvarCompra} disabled={saving}>{saving ? "Salvando..." : "Registrar"}</Btn>
+            <Btn onClick={salvarCompra} disabled={saving}>{saving ? "Salvando..." : "Registrar Compra"}</Btn>
             <Btn ghost onClick={() => setModalCompra(false)}>Cancelar</Btn>
           </div>
         </Modal>
