@@ -1067,6 +1067,7 @@ function Fornecedores() {
   const [modalConfirm, setModalConfirm] = useState(null);
   const [expandido, setExpandido] = useState({});
   const [saving, setSaving] = useState(false);
+  const [erroPedido, setErroPedido] = useState(null);
   const emptyF = { nome: "", whatsapp: "", instagram: "", cidade: "", prazo: "", obs: "" };
   const emptyHeader = { fornecedor: "", data: today(), prazo_entrega: "", frete: "" };
   const emptyItem = { produto_nome: "", tamanho: "M", quantidade: "", valor_unit: "" };
@@ -1099,10 +1100,18 @@ function Fornecedores() {
   const removeItem = (idx) => setPedidoItens(prev => prev.filter((_, i) => i !== idx));
   const updateItem = (idx, field, value) => setPedidoItens(prev => prev.map((it, i) => i === idx ? { ...it, [field]: value } : it));
 
+  const SIZES = ["PP", "P", "M", "G", "GG", "2GG", "3GG", "4GG"];
+  const parseProduto = (compra) => {
+    if (compra.produto_nome && compra.tamanho) return { nome: compra.produto_nome, tamanho: compra.tamanho };
+    const parts = (compra.produto || "").trim().split(" ");
+    const last = parts[parts.length - 1];
+    if (SIZES.includes(last)) return { nome: parts.slice(0, -1).join(" "), tamanho: last };
+    return { nome: compra.produto || "", tamanho: "" };
+  };
   const getProdEstoque = (compra) => {
-    if (compra.produto_nome && compra.tamanho)
-      return produtos.find(p => p.nome === compra.produto_nome && p.tamanho === compra.tamanho);
-    return produtos.find(p => `${p.nome} ${p.tamanho}` === compra.produto || p.nome === compra.produto);
+    const { nome, tamanho } = parseProduto(compra);
+    if (nome && tamanho) return produtos.find(p => p.nome === nome && p.tamanho === tamanho);
+    return produtos.find(p => p.nome === nome);
   };
 
   const calcImpacto = (compra) => {
@@ -1122,44 +1131,56 @@ function Fornecedores() {
     setModalCompra(false);
     setPedidoItens([{ ...emptyItem }]);
     setPedidoHeader(emptyHeader);
+    setErroPedido(null);
   };
 
   const salvarPedido = async () => {
     const itensValidos = pedidoItens.filter(i => i.produto_nome && i.quantidade && i.valor_unit);
     if (!pedidoHeader.fornecedor || itensValidos.length === 0) return;
     setSaving(true);
+    setErroPedido(null);
     try {
       for (const item of itensValidos) {
-        const itemSubtotal = Number(item.quantidade) * Number(item.valor_unit);
+        const qtd = Number(String(item.quantidade).replace(",", "."));
+        const vunit = Number(String(item.valor_unit).replace(",", "."));
+        const itemSubtotal = qtd * vunit;
         const freteRateado = subtotalPedido > 0 ? (itemSubtotal / subtotalPedido) * fretePedido : 0;
         const total = itemSubtotal + freteRateado;
-        const custoReal = total / Number(item.quantidade);
+        const custoReal = qtd > 0 ? total / qtd : 0;
 
+        // Envia apenas as colunas que existem na tabela original de compras
         await addCompra({
           fornecedor: pedidoHeader.fornecedor,
           produto: `${item.produto_nome} ${item.tamanho}`.trim(),
-          produto_nome: item.produto_nome,
-          tamanho: item.tamanho,
-          quantidade: Number(item.quantidade),
-          valor_unit: Number(item.valor_unit),
+          quantidade: qtd,
+          valor_unit: vunit,
           frete: freteRateado,
           total,
           data: pedidoHeader.data,
-          prazo_entrega: pedidoHeader.prazo_entrega,
+          prazo_entrega: pedidoHeader.prazo_entrega || null,
           status: "Pedido realizado",
         });
 
-        const prod = produtos.find(p => p.nome === item.produto_nome && p.tamanho === item.tamanho);
-        if (prod) {
-          await db.update("produtos", prod.id, {
-            quantidade: Number(prod.quantidade) + Number(item.quantidade),
-            custo: custoReal,
-          });
+        // Atualiza estoque — erro aqui não cancela o pedido já salvo
+        try {
+          const prod = produtos.find(p => p.nome === item.produto_nome && p.tamanho === item.tamanho);
+          if (prod) {
+            await db.update("produtos", prod.id, {
+              quantidade: Number(prod.quantidade) + qtd,
+              custo: custoReal,
+            });
+          }
+        } catch (estoqueErr) {
+          console.warn("Estoque não atualizado para", item.produto_nome, item.tamanho, ":", estoqueErr.message);
         }
       }
       await reloadProdutos();
       fecharModalCompra();
-    } finally { setSaving(false); }
+    } catch (e) {
+      setErroPedido(e.message || "Erro ao salvar o pedido. Verifique os campos e tente novamente.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   // Cancelar / excluir item individual
@@ -1289,11 +1310,12 @@ function Fornecedores() {
                         </thead>
                         <tbody>
                           {itens.map(c => {
+                            const { nome: pNome, tamanho: pTam } = parseProduto(c);
                             const custoUnit = Number(c.quantidade) > 0 ? Number(c.total) / Number(c.quantidade) : 0;
                             return (
                               <tr key={c.id} style={{ borderTop: `1px solid ${C.border}`, opacity: c.status === "Cancelado" ? 0.5 : 1 }}>
-                                <td style={{ padding: "8px", color: C.text }}>{c.produto_nome || c.produto}</td>
-                                <td style={{ padding: "8px", color: C.text }}>{c.tamanho}</td>
+                                <td style={{ padding: "8px", color: C.text }}>{pNome}</td>
+                                <td style={{ padding: "8px", color: C.text }}>{pTam}</td>
                                 <td style={{ padding: "8px", color: C.text, textAlign: "center" }}>{c.quantidade}</td>
                                 <td style={{ padding: "8px", color: C.text }}>{fmt(c.valor_unit)}</td>
                                 <td style={{ padding: "8px", color: C.gray }}>{fmt(c.frete)}</td>
@@ -1419,6 +1441,12 @@ function Fornecedores() {
                 <span style={{ color: C.textMuted }}>Total de peças</span><span style={{ color: C.text, textAlign: "right" }}>{totalPecasForm} un.</span>
                 <span style={{ color: C.yellow, fontWeight: 800 }}>Total geral</span><span style={{ color: C.yellow, fontWeight: 800, textAlign: "right" }}>{fmt(totalPedidoForm)}</span>
               </div>
+            </div>
+          )}
+
+          {erroPedido && (
+            <div style={{ background: C.dangerBg, border: `1px solid ${C.danger}44`, borderRadius: 8, padding: "10px 14px", fontSize: 13, color: C.danger, marginBottom: 12 }}>
+              ❌ {erroPedido}
             </div>
           )}
 
