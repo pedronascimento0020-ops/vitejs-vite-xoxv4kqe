@@ -1161,13 +1161,24 @@ function Fornecedores() {
           status: "Pedido realizado",
         });
 
-        // Atualiza estoque — erro aqui não cancela o pedido já salvo
+        // Atualiza ou cria produto no estoque — erro aqui não cancela o pedido já salvo
         try {
           const prod = produtos.find(p => p.nome === item.produto_nome && p.tamanho === item.tamanho);
           if (prod) {
-            await db.update("produtos", prod.id, {
-              quantidade: Number(prod.quantidade) + qtd,
+            await db.update("produtos", prod.id, { quantidade: Number(prod.quantidade) + qtd, custo: custoReal });
+          } else {
+            // Produto/tamanho novo: cria a variação no estoque
+            await db.insert("produtos", {
+              nome: item.produto_nome,
+              tamanho: item.tamanho,
+              quantidade: qtd,
               custo: custoReal,
+              preco: 0,
+              categoria: "Torcedor",
+              clube: "",
+              temporada: "",
+              cor: "",
+              obs: `Criado automaticamente via compra de ${pedidoHeader.fornecedor}`,
             });
           }
         } catch (estoqueErr) {
@@ -1387,7 +1398,7 @@ function Fornecedores() {
           <div style={{ ...S.label, marginBottom: 10 }}>Itens do Pedido</div>
           <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
             {pedidoItens.map((item, idx) => {
-              const tamOpts = item.produto_nome ? produtos.filter(p => p.nome === item.produto_nome).map(p => p.tamanho) : [];
+              const tamOpts = ["PP", "P", "M", "G", "GG", "2GG", "3GG", "4GG"];
               const itemSub = (Number(item.quantidade) || 0) * (Number(item.valor_unit) || 0);
               const freteRat = subtotalPedido > 0 ? (itemSub / subtotalPedido) * fretePedido : 0;
               const custoUn = Number(item.quantidade) > 0 ? (itemSub + freteRat) / Number(item.quantidade) : 0;
@@ -1423,7 +1434,7 @@ function Fornecedores() {
                     <div style={{ marginTop: 8, fontSize: 11, color: C.gray, display: "flex", gap: 12, flexWrap: "wrap" }}>
                       <span>Subtotal: <strong style={{ color: C.yellow }}>{fmt(itemSub)}</strong></span>
                       {fretePedido > 0 && <><span>Frete rat.: <strong>{fmt(freteRat)}</strong></span><span>Custo/un: <strong style={{ color: C.success }}>{fmt(custoUn)}</strong></span></>}
-                      {item.produto_nome && <span style={{ color: noEstoque ? C.success : C.warn }}>{noEstoque ? "✅ estoque será atualizado" : "⚠️ produto não encontrado no estoque"}</span>}
+                      {item.produto_nome && <span style={{ color: noEstoque ? C.success : C.info }}>{noEstoque ? "✅ estoque será atualizado" : "🆕 será criado no estoque automaticamente"}</span>}
                     </div>
                   )}
                 </div>
