@@ -491,10 +491,15 @@ function Vendas() {
   const naoSincronizadas = rows.filter(v => !isVendaCancelada(v) && !getSincronizadas().has(String(v.id)));
 
   const nomesUnicos = [...new Set(produtos.map(p => p.nome))].sort();
-  // Tamanhos disponíveis em estoque, na ordem correta
-  const tamanhosDisponiveis = form.produto_nome
-    ? sortTamanhos(produtos.filter(p => p.nome === form.produto_nome && Number(p.quantidade) > 0).map(p => p.tamanho))
-    : [];
+  // Mapa de estoque por tamanho para o produto selecionado
+  const estoquePorTamanho = form.produto_nome
+    ? Object.fromEntries(
+        produtos
+          .filter(p => p.nome === form.produto_nome)
+          .map(p => [p.tamanho, Number(p.quantidade || 0)])
+      )
+    : {};
+  // Lista sempre usa SIZES fixo — nunca depende do banco para a ordem/existência
   const produtoEscolhido = produtos.find(p => p.nome === form.produto_nome && p.tamanho === form.tamanho);
 
   // Valores calculados a partir do preço unitário e quantidade
@@ -511,10 +516,11 @@ function Vendas() {
   const estoqueInsuficiente = produtoEscolhido && qtd > estoqueDisponivel;
 
   const selecionarProduto = (nome) => {
-    const c = sortTamanhos(
-      produtos.filter(p => p.nome === nome && Number(p.quantidade) > 0).map(p => p.tamanho)
-    );
-    const primTam = c[0] || "";
+    // Primeiro tamanho com estoque, respeitando a ordem fixa SIZES
+    const primTam = SIZES.find(tam => {
+      const p = produtos.find(x => x.nome === nome && x.tamanho === tam);
+      return p && Number(p.quantidade) > 0;
+    }) || "";
     const prod = produtos.find(p => p.nome === nome && p.tamanho === primTam);
     setForm({ ...form, produto_nome: nome, tamanho: primTam, custo: prod?.custo || "", valor: prod?.preco || "" });
   };
@@ -677,19 +683,51 @@ function Vendas() {
             <datalist id="produtos-unicos-list">{nomesUnicos.map(n => <option key={n} value={n} />)}</datalist>
           </Field>
           {form.produto_nome && (
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+            <>
               <Field label="Tamanho">
-                {tamanhosDisponiveis.length > 0
-                  ? <Select value={form.tamanho} onChange={e => selecionarTamanho(e.target.value)} options={tamanhosDisponiveis} />
-                  : <div style={{ color: C.danger, fontSize: 12, padding: "10px 0" }}>⚠️ Sem estoque</div>}
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {SIZES.map(tam => {
+                    const qtdEstoque = estoquePorTamanho[tam] ?? 0;
+                    const temEstoque = qtdEstoque > 0;
+                    const selecionado = form.tamanho === tam;
+                    return (
+                      <button
+                        key={tam}
+                        type="button"
+                        onClick={() => temEstoque ? selecionarTamanho(tam) : null}
+                        style={{
+                          minWidth: 52,
+                          padding: "7px 10px",
+                          borderRadius: 8,
+                          border: selecionado ? `2px solid ${C.yellow}` : `1px solid ${temEstoque ? C.border : C.border}`,
+                          background: selecionado ? C.yellowBg : temEstoque ? C.surface : "#0d0d0d",
+                          color: selecionado ? C.yellow : temEstoque ? C.text : C.grayLight,
+                          fontWeight: selecionado ? 800 : 600,
+                          fontSize: 13,
+                          cursor: temEstoque ? "pointer" : "not-allowed",
+                          opacity: temEstoque ? 1 : 0.45,
+                          textAlign: "center",
+                          lineHeight: 1.2,
+                        }}
+                      >
+                        <div>{tam}</div>
+                        <div style={{ fontSize: 10, color: selecionado ? C.yellow : temEstoque ? C.success : C.grayLight, marginTop: 2 }}>
+                          {temEstoque ? `${qtdEstoque}un` : "—"}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
               </Field>
-              <Field label="Quantidade">
-                <Input type="number" min="1" value={form.quantidade} onChange={e => { setErro(null); setForm({ ...form, quantidade: e.target.value }); }} />
-              </Field>
-              <Field label="Preço Unit. (R$)">
-                <Input type="number" value={form.valor} onChange={e => setForm({ ...form, valor: e.target.value })} placeholder="0,00" />
-              </Field>
-            </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <Field label="Quantidade">
+                  <Input type="number" min="1" value={form.quantidade} onChange={e => { setErro(null); setForm({ ...form, quantidade: e.target.value }); }} />
+                </Field>
+                <Field label="Preço Unit. (R$)">
+                  <Input type="number" value={form.valor} onChange={e => setForm({ ...form, valor: e.target.value })} placeholder="0,00" />
+                </Field>
+              </div>
+            </>
           )}
           {produtoEscolhido && (
             <div style={{ background: estoqueInsuficiente ? C.dangerBg : C.successBg, border: `1px solid ${estoqueInsuficiente ? C.danger : C.success}33`, borderRadius: 8, padding: "10px 14px", fontSize: 12, color: C.text, marginBottom: 10 }}>
