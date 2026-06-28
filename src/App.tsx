@@ -90,6 +90,13 @@ const STATUS_COLORS = {
 const fmt = (v) => (Number(v) || 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 const pct = (v, t) => t > 0 ? Math.min(100, Math.round((v / t) * 100)) : 0;
 const today = () => new Date().toISOString().slice(0, 10);
+const SIZES = ["PP", "P", "M", "G", "GG", "2GG", "3GG", "4GG"];
+const sortTamanhos = (arr) => [...arr].sort((a, b) => {
+  const ia = SIZES.indexOf(a); const ib = SIZES.indexOf(b);
+  if (ia === -1 && ib === -1) return a.localeCompare(b);
+  if (ia === -1) return 1; if (ib === -1) return -1;
+  return ia - ib;
+});
 
 // ============================================================
 // SHARED COMPONENTS
@@ -476,6 +483,7 @@ function Vendas() {
   const vendasAtivas = rows.filter(v => !isVendaCancelada(v));
   const fat = vendasAtivas.reduce((a, v) => a + Number(v.valor || 0), 0);
   const lucro = vendasAtivas.reduce((a, v) => a + Number(v.lucro || 0), 0);
+  const totalPecas = vendasAtivas.reduce((a, v) => a + Number(v.quantidade || 1), 0);
   const ticket = vendasAtivas.length > 0 ? fat / vendasAtivas.length : 0;
   const margem = fat > 0 ? (lucro / fat) * 100 : 0;
 
@@ -483,14 +491,32 @@ function Vendas() {
   const naoSincronizadas = rows.filter(v => !isVendaCancelada(v) && !getSincronizadas().has(String(v.id)));
 
   const nomesUnicos = [...new Set(produtos.map(p => p.nome))].sort();
+  // Tamanhos disponíveis em estoque, na ordem correta
   const tamanhosDisponiveis = form.produto_nome
-    ? produtos.filter(p => p.nome === form.produto_nome && Number(p.quantidade) > 0).map(p => p.tamanho)
+    ? sortTamanhos(produtos.filter(p => p.nome === form.produto_nome && Number(p.quantidade) > 0).map(p => p.tamanho))
     : [];
   const produtoEscolhido = produtos.find(p => p.nome === form.produto_nome && p.tamanho === form.tamanho);
 
+  // Valores calculados a partir do preço unitário e quantidade
+  const qtd = Math.max(1, Number(form.quantidade) || 1);
+  const precoUnit = Number(form.valor) || 0;          // campo valor = preço unitário
+  const custoUnit = Number(form.custo) || Number(produtoEscolhido?.custo) || 0;
+  const valorTotal = precoUnit * qtd;
+  const custoTotal = custoUnit * qtd;
+  const desconto = Number(form.desconto) || 0;
+  const frete = Number(form.frete) || 0;
+  const lucroEstimado = valorTotal - custoTotal - desconto;
+  const margemEstimada = valorTotal > 0 ? (lucroEstimado / valorTotal) * 100 : 0;
+  const estoqueDisponivel = Number(produtoEscolhido?.quantidade || 0);
+  const estoqueInsuficiente = produtoEscolhido && qtd > estoqueDisponivel;
+
   const selecionarProduto = (nome) => {
-    const c = produtos.filter(p => p.nome === nome && Number(p.quantidade) > 0)[0];
-    setForm({ ...form, produto_nome: nome, tamanho: c?.tamanho || "", custo: c?.custo || "", valor: c?.preco || "" });
+    const c = sortTamanhos(
+      produtos.filter(p => p.nome === nome && Number(p.quantidade) > 0).map(p => p.tamanho)
+    );
+    const primTam = c[0] || "";
+    const prod = produtos.find(p => p.nome === nome && p.tamanho === primTam);
+    setForm({ ...form, produto_nome: nome, tamanho: primTam, custo: prod?.custo || "", valor: prod?.preco || "" });
   };
   const selecionarTamanho = (tam) => {
     const p = produtos.find(p => p.nome === form.produto_nome && p.tamanho === tam);
@@ -498,26 +524,36 @@ function Vendas() {
   };
 
   const salvar = async () => {
-    if (!form.cliente_nome || !form.produto_nome || !form.valor) return;
+    if (!form.cliente_nome || !form.produto_nome || !precoUnit) {
+      setErro("Preencha cliente, produto e preço unitário."); return;
+    }
+    if (estoqueInsuficiente) {
+      setErro(`Estoque insuficiente. Disponível: ${estoqueDisponivel} un.`); return;
+    }
     setSaving(true);
     setErro(null);
     try {
-      const custo = Number(form.custo) || Number(produtoEscolhido?.custo) || 0;
-      const lucroCalc = Number(form.valor) - custo - Number(form.desconto || 0);
-      const payload = { ...form, valor: Number(form.valor), custo, lucro: lucroCalc, desconto: Number(form.desconto || 0), frete: Number(form.frete || 0), quantidade: Number(form.quantidade) };
+      // Salva com valores TOTAIS (qtd × unit)
+      const payload = {
+        ...form,
+        quantidade: qtd,
+        valor: valorTotal,        // total da venda
+        custo: custoTotal,        // custo total
+        lucro: lucroEstimado,     // lucro total
+        desconto,
+        frete,
+      };
 
-      // Tenta salvar com status; cai sem ele se coluna não existir
       let saved;
       try { saved = await add({ ...payload, status: "Concluída" }); }
       catch { saved = await add(payload); }
 
-      // Rastreia no localStorage que essa venda já reduziu estoque
       if (saved?.id) marcarSincronizada(saved.id);
 
-      // Baixa no estoque
+      // Baixa estoque pela quantidade
       if (produtoEscolhido) {
         await db.update("produtos", produtoEscolhido.id, {
-          quantidade: Math.max(0, Number(produtoEscolhido.quantidade) - Number(form.quantidade)),
+          quantidade: Math.max(0, estoqueDisponivel - qtd),
         });
         await reloadProdutos();
       }
@@ -590,10 +626,11 @@ function Vendas() {
 
   return (
     <div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 24 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 12, marginBottom: 24 }}>
         <KpiCard label="Faturamento" value={fmt(fat)} icon="💰" />
         <KpiCard label="Lucro Total" value={fmt(lucro)} accent={C.yellow} icon="✨" />
-        <KpiCard label="Qtd Vendas" value={vendasAtivas.length} icon="🛍️" />
+        <KpiCard label="Pedidos" value={vendasAtivas.length} icon="🛍️" />
+        <KpiCard label="Peças Vendidas" value={totalPecas} accent={C.info} icon="👕" />
         <KpiCard label="Margem Média" value={`${margem.toFixed(1)}%`} accent={C.success} icon="📊" />
       </div>
 
@@ -615,8 +652,9 @@ function Vendas() {
             { key: "cliente_nome", label: "Cliente" },
             { key: "produto_nome", label: "Produto" },
             { key: "tamanho", label: "Tam." },
+            { key: "quantidade", label: "Qtd", align: "center", render: v => <span style={{ color: C.info, fontWeight: 700 }}>{v || 1}</span> },
             { key: "forma_pagamento", label: "Pgto", render: v => <Badge status={v} /> },
-            { key: "valor", label: "Valor", align: "right", render: (v, r) => <span style={{ textDecoration: isVendaCancelada(r) ? "line-through" : "none", color: isVendaCancelada(r) ? C.gray : C.text }}>{fmt(v)}</span> },
+            { key: "valor", label: "Total", align: "right", render: (v, r) => <span style={{ textDecoration: isVendaCancelada(r) ? "line-through" : "none", color: isVendaCancelada(r) ? C.gray : C.text }}>{fmt(v)}</span> },
             { key: "lucro", label: "Lucro", align: "right", render: (v, r) => isVendaCancelada(r) ? <Badge status="Cancelada" /> : <span style={{ color: C.success, fontWeight: 700 }}>{fmt(v)}</span> },
             { key: "id", label: "", render: (v, r) => !isVendaCancelada(r) && (
               <button onClick={() => setModalCancelar(r)} style={{ ...S.btnDanger, padding: "4px 10px", fontSize: 11 }}>✕ Cancelar</button>
@@ -645,17 +683,23 @@ function Vendas() {
                   ? <Select value={form.tamanho} onChange={e => selecionarTamanho(e.target.value)} options={tamanhosDisponiveis} />
                   : <div style={{ color: C.danger, fontSize: 12, padding: "10px 0" }}>⚠️ Sem estoque</div>}
               </Field>
-              <Field label="Qtd"><Input type="number" value={form.quantidade} onChange={e => setForm({ ...form, quantidade: e.target.value })} /></Field>
-              <Field label="Valor (R$)"><Input type="number" value={form.valor} onChange={e => setForm({ ...form, valor: e.target.value })} /></Field>
+              <Field label="Quantidade">
+                <Input type="number" min="1" value={form.quantidade} onChange={e => { setErro(null); setForm({ ...form, quantidade: e.target.value }); }} />
+              </Field>
+              <Field label="Preço Unit. (R$)">
+                <Input type="number" value={form.valor} onChange={e => setForm({ ...form, valor: e.target.value })} placeholder="0,00" />
+              </Field>
             </div>
           )}
           {produtoEscolhido && (
-            <div style={{ background: C.successBg, border: `1px solid ${C.success}33`, borderRadius: 8, padding: "10px 14px", fontSize: 12, color: C.text, marginBottom: 10 }}>
-              ✅ <strong>{produtoEscolhido.nome} {produtoEscolhido.tamanho}</strong> · Estoque: {produtoEscolhido.quantidade} un. · Custo: {fmt(produtoEscolhido.custo)}
+            <div style={{ background: estoqueInsuficiente ? C.dangerBg : C.successBg, border: `1px solid ${estoqueInsuficiente ? C.danger : C.success}33`, borderRadius: 8, padding: "10px 14px", fontSize: 12, color: C.text, marginBottom: 10 }}>
+              {estoqueInsuficiente
+                ? `❌ Estoque insuficiente: apenas ${estoqueDisponivel} un. disponíveis para ${produtoEscolhido.nome} ${produtoEscolhido.tamanho}`
+                : `✅ ${produtoEscolhido.nome} ${produtoEscolhido.tamanho} · Estoque: ${estoqueDisponivel} un. · Custo unit.: ${fmt(produtoEscolhido.custo)}`}
             </div>
           )}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
-            <Field label="Custo (R$)"><Input type="number" value={form.custo} onChange={e => setForm({ ...form, custo: e.target.value })} /></Field>
+            <Field label="Custo Unit. (R$)"><Input type="number" value={form.custo} onChange={e => setForm({ ...form, custo: e.target.value })} /></Field>
             <Field label="Desconto (R$)"><Input type="number" value={form.desconto} onChange={e => setForm({ ...form, desconto: e.target.value })} /></Field>
             <Field label="Frete (R$)"><Input type="number" value={form.frete} onChange={e => setForm({ ...form, frete: e.target.value })} /></Field>
           </div>
@@ -663,9 +707,25 @@ function Vendas() {
             <Field label="Pagamento"><Select value={form.forma_pagamento} onChange={e => setForm({ ...form, forma_pagamento: e.target.value })} options={["PIX", "Dinheiro", "Débito", "Crédito", "Fiado", "Outro"]} /></Field>
             <Field label="Data"><Input type="date" value={form.data} onChange={e => setForm({ ...form, data: e.target.value })} /></Field>
           </div>
-          {form.valor && form.custo && (
-            <div style={{ background: C.yellowBg, borderRadius: 8, padding: "10px 14px", fontSize: 13, color: C.yellow, marginBottom: 12 }}>
-              Lucro estimado: {fmt(Number(form.valor) - Number(form.custo) - Number(form.desconto || 0))}
+          {precoUnit > 0 && (
+            <div style={{ background: C.yellowBg, border: `1px solid ${C.yellow}33`, borderRadius: 8, padding: "12px 16px", fontSize: 13, color: C.text, marginBottom: 12 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                <div>
+                  <div style={{ fontSize: 11, color: C.gray, marginBottom: 3 }}>Valor Total</div>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: C.yellow }}>{fmt(valorTotal)}</div>
+                  <div style={{ fontSize: 11, color: C.textMuted }}>{fmt(precoUnit)} × {qtd} un.</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, color: C.gray, marginBottom: 3 }}>Custo Total</div>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: C.danger }}>{fmt(custoTotal)}</div>
+                  <div style={{ fontSize: 11, color: C.textMuted }}>{fmt(custoUnit)} × {qtd} un.</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, color: C.gray, marginBottom: 3 }}>Lucro Est.</div>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: lucroEstimado >= 0 ? C.success : C.danger }}>{fmt(lucroEstimado)}</div>
+                  <div style={{ fontSize: 11, color: C.textMuted }}>Margem {margemEstimada.toFixed(0)}%</div>
+                </div>
+              </div>
             </div>
           )}
           {erro && <div style={{ background: C.dangerBg, borderRadius: 8, padding: "10px 14px", fontSize: 13, color: C.danger, marginBottom: 12 }}>❌ {erro}</div>}
@@ -1381,7 +1441,6 @@ function Fornecedores() {
   const removeItem = (idx) => setPedidoItens(prev => prev.filter((_, i) => i !== idx));
   const updateItem = (idx, field, value) => setPedidoItens(prev => prev.map((it, i) => i === idx ? { ...it, [field]: value } : it));
 
-  const SIZES = ["PP", "P", "M", "G", "GG", "2GG", "3GG", "4GG"];
   const parseProduto = (compra) => {
     if (compra.produto_nome && compra.tamanho) return { nome: compra.produto_nome, tamanho: compra.tamanho };
     const parts = (compra.produto || "").trim().split(" ");
