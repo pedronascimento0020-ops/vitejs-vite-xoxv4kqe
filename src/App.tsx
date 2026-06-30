@@ -1054,39 +1054,142 @@ function Pedidos() {
 // MÓDULO: FIADO
 // ============================================================
 function Fiado() {
-  const { rows, loading, add, edit } = useTable("fiado");
+  const { rows, loading, add, edit, reload } = useTable("fiado");
+  const { rows: clientes } = useTable("clientes");
+  const { rows: produtos, reload: reloadProdutos } = useTable("produtos");
+  const { add: addFin } = useTable("financeiro");
+
   const [modal, setModal] = useState(false);
+  const [cancelModal, setCancelModal] = useState(null);
   const [saving, setSaving] = useState(false);
-  const empty = { cliente: "", whatsapp: "", produto: "", valor: "", data: today(), vencimento: "", status: "Pendente" };
-  const [form, setForm] = useState(empty);
+  const [erro, setErro] = useState(null);
 
-  const pendentes = rows.filter(f => f.status !== "Pago");
-  const atrasados = rows.filter(f => f.status === "Atrasado");
-  const total = pendentes.reduce((a, f) => a + Number(f.valor || 0), 0);
+  const emptyForm = { cliente: "", whatsapp: "", produto_nome: "", tamanho: "", qtd: 1, valor_unit: "", data: today(), vencimento: "" };
+  const [form, setForm] = useState(emptyForm);
 
-  const marcarPago = async (id) => { await edit(id, { status: "Pago" }); };
+  // Encode/decode produto field as "nome|tamanho|qtd"
+  const parseProduto = (p) => {
+    const parts = (p || "").split("|");
+    return { nomeProd: parts[0] || p || "", tamanho: parts[1] || "", qtd: Number(parts[2] || 1) };
+  };
+
+  // Enrich rows with parsed produto and computed overdue status
+  const todayStr = today();
+  const enriched = rows.map(f => {
+    const parsed = parseProduto(f.produto);
+    const isAtrasado = f.status === "Pendente" && f.vencimento && f.vencimento < todayStr;
+    return { ...f, ...parsed, statusReal: isAtrasado ? "Atrasado" : f.status };
+  });
+
+  const aReceber = enriched.filter(f => f.statusReal === "Pendente" || f.statusReal === "Atrasado");
+  const atrasados = enriched.filter(f => f.statusReal === "Atrasado");
+  const pendentes = enriched.filter(f => f.statusReal === "Pendente");
+  const totalAReceber = aReceber.reduce((a, f) => a + Number(f.valor || 0), 0);
+
+  // Form derived values
+  const estoquePorTamanho = Object.fromEntries(
+    produtos.filter(p => p.nome === form.produto_nome).map(p => [p.tamanho, Number(p.quantidade || 0)])
+  );
+  const produtoEscolhido = produtos.find(p => p.nome === form.produto_nome && p.tamanho === form.tamanho);
+  const estoqueDisponivel = produtoEscolhido ? Number(produtoEscolhido.quantidade || 0) : 0;
+  const qtd = Math.max(1, Number(form.qtd) || 1);
+  const valorUnit = Number(form.valor_unit) || 0;
+  const valorTotal = valorUnit * qtd;
+  const estoqueInsuficiente = !!(form.tamanho && qtd > estoqueDisponivel);
+
+  const produtoNomes = [...new Set(produtos.map(p => p.nome))].sort();
+
+  const selecionarProduto = (nome) => {
+    const estMap = Object.fromEntries(produtos.filter(p => p.nome === nome).map(p => [p.tamanho, Number(p.quantidade || 0)]));
+    const firstTam = SIZES.find(s => (estMap[s] || 0) > 0) || "";
+    setForm(f => ({ ...f, produto_nome: nome, tamanho: firstTam }));
+  };
+
   const msg = (nome, valor) => encodeURIComponent(`Fala, ${nome}, tudo certo? Passando para lembrar do pagamento de ${fmt(valor)} da Vibra FC. Assim que fizer o PIX, me manda o comprovante. Obrigado! ⚡`);
 
+  const marcarPago = async (f) => {
+    try {
+      await edit(f.id, { status: "Pago" });
+      await addFin({
+        tipo: "entrada",
+        categoria: "Recebimento de fiado",
+        descricao: `Fiado pago – ${f.cliente} – ${f.nomeProd}${f.tamanho ? " " + f.tamanho : ""}`,
+        valor: Number(f.valor || 0),
+        data: todayStr,
+      });
+    } catch (e) {
+      alert("Erro ao marcar como pago: " + (e.message || e));
+    }
+  };
+
+  const confirmarCancelamento = async () => {
+    if (!cancelModal) return;
+    const f = cancelModal;
+    try {
+      // Devolve estoque
+      const prod = produtos.find(p => p.nome === f.nomeProd && p.tamanho === f.tamanho);
+      if (prod) {
+        await db.update("produtos", prod.id, { quantidade: Number(prod.quantidade || 0) + f.qtd });
+      }
+      await edit(f.id, { status: "Cancelado" });
+      reloadProdutos();
+    } catch (e) {
+      alert("Erro ao cancelar fiado: " + (e.message || e));
+    } finally {
+      setCancelModal(null);
+    }
+  };
+
   const salvar = async () => {
-    if (!form.cliente || !form.valor) return;
+    setErro(null);
+    if (!form.cliente) { setErro("Selecione ou informe o cliente."); return; }
+    if (!form.produto_nome) { setErro("Selecione o produto."); return; }
+    if (!form.tamanho) { setErro("Selecione o tamanho."); return; }
+    if (!form.valor_unit || valorUnit <= 0) { setErro("Informe o preço unitário."); return; }
+    if (!form.vencimento) { setErro("Informe a data de vencimento."); return; }
+    if (estoqueInsuficiente) { setErro(`Estoque insuficiente. Disponível: ${estoqueDisponivel}`); return; }
+
     setSaving(true);
     try {
-      await add({ ...form, valor: Number(form.valor) });
+      // Baixa estoque
+      if (produtoEscolhido) {
+        await db.update("produtos", produtoEscolhido.id, { quantidade: estoqueDisponivel - qtd });
+      }
+      // Pega whatsapp do cliente se não informado
+      const clienteObj = clientes.find(c => c.nome === form.cliente);
+      const wpp = form.whatsapp || clienteObj?.whatsapp || "";
+
+      await add({
+        cliente: form.cliente,
+        whatsapp: wpp,
+        produto: `${form.produto_nome}|${form.tamanho}|${qtd}`,
+        valor: valorTotal,
+        data: form.data,
+        vencimento: form.vencimento,
+        status: "Pendente",
+      });
       setModal(false);
-      setForm(empty);
-    } finally { setSaving(false); }
+      setForm(emptyForm);
+      reloadProdutos();
+    } catch (e) {
+      setErro(e.message || "Erro ao salvar fiado.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   if (loading) return <Loading />;
 
   return (
     <div>
+      {/* KPI Cards */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12, marginBottom: 24 }}>
-        <KpiCard label="A Receber Total" value={fmt(total)} accent={C.warn} icon="⏳" />
+        <KpiCard label="A Receber Total" value={fmt(totalAReceber)} accent={C.warn} icon="⏳" />
         <KpiCard label="Atrasados" value={atrasados.length} accent={C.danger} icon="🚨" />
         <KpiCard label="Pendentes" value={pendentes.length} icon="👤" />
       </div>
 
+      {/* Alerta de atrasados */}
       {atrasados.length > 0 && (
         <div style={{ ...S.card, background: C.dangerBg, border: `1px solid ${C.danger}33`, marginBottom: 20 }}>
           <div style={{ ...S.sectionTitle, color: C.danger }}>🚨 Pagamentos Atrasados</div>
@@ -1094,54 +1197,154 @@ function Fiado() {
             <div key={f.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: `1px solid ${C.border}` }}>
               <div>
                 <div style={{ color: C.text, fontSize: 13, fontWeight: 700 }}>{f.cliente}</div>
-                <div style={{ color: C.gray, fontSize: 12 }}>{f.produto} — venceu {f.vencimento}</div>
+                <div style={{ color: C.gray, fontSize: 12 }}>{f.nomeProd}{f.tamanho ? ` – ${f.tamanho}` : ""} · venceu {f.vencimento}</div>
               </div>
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                 <span style={{ color: C.danger, fontWeight: 700 }}>{fmt(f.valor)}</span>
-                <a href={`https://wa.me/55${f.whatsapp}?text=${msg(f.cliente, f.valor)}`} target="_blank" rel="noreferrer">
-                  <Btn style={{ ...S.btn, padding: "6px 12px", fontSize: 11 }}>💬 Cobrar</Btn>
-                </a>
+                {f.whatsapp && (
+                  <a href={`https://wa.me/55${f.whatsapp}?text=${msg(f.cliente, f.valor)}`} target="_blank" rel="noreferrer">
+                    <button style={{ ...S.btnGhost, padding: "4px 10px", fontSize: 11 }}>💬 Cobrar</button>
+                  </a>
+                )}
+                <button onClick={() => marcarPago(f)} style={{ ...S.btn, padding: "4px 10px", fontSize: 11 }}>✓ Pago</button>
               </div>
             </div>
           ))}
         </div>
       )}
 
-      <SectionHeader title="Fiado e Contas a Receber" action={<Btn onClick={() => setModal(true)}>+ Registrar Fiado</Btn>} />
+      {/* Lista de fiados */}
+      <SectionHeader title="Fiado e Contas a Receber" action={<Btn onClick={() => { setErro(null); setForm(emptyForm); setModal(true); }}>+ Registrar Fiado</Btn>} />
       <div style={S.card}>
         <Table
           cols={[
             { key: "cliente", label: "Cliente" },
-            { key: "produto", label: "Produto" },
+            { key: "nomeProd", label: "Produto", render: (v, r) => `${v}${r.tamanho ? " – " + r.tamanho : ""}${r.qtd > 1 ? " x" + r.qtd : ""}` },
             { key: "valor", label: "Valor", align: "right", render: v => fmt(v) },
+            { key: "data", label: "Data venda" },
             { key: "vencimento", label: "Vencimento" },
-            { key: "status", label: "Status", render: v => <Badge status={v} /> },
+            { key: "statusReal", label: "Status", render: v => <Badge status={v} /> },
             { key: "id", label: "Ações", render: (v, r) => (
               <div style={{ display: "flex", gap: 6 }}>
-                {r.status !== "Pago" && <>
-                  <button onClick={() => marcarPago(v)} style={{ ...S.btn, padding: "4px 10px", fontSize: 11 }}>✓ Pago</button>
-                  {r.whatsapp && <a href={`https://wa.me/55${r.whatsapp}?text=${msg(r.cliente, r.valor)}`} target="_blank" rel="noreferrer"><button style={{ ...S.btnGhost, padding: "4px 10px", fontSize: 11 }}>💬</button></a>}
-                </>}
+                {(r.statusReal === "Pendente" || r.statusReal === "Atrasado") && (
+                  <>
+                    <button onClick={() => marcarPago(r)} style={{ ...S.btn, padding: "4px 10px", fontSize: 11 }}>✓ Pago</button>
+                    {r.whatsapp && (
+                      <a href={`https://wa.me/55${r.whatsapp}?text=${msg(r.cliente, r.valor)}`} target="_blank" rel="noreferrer">
+                        <button style={{ ...S.btnGhost, padding: "4px 10px", fontSize: 11 }}>💬</button>
+                      </a>
+                    )}
+                    <button onClick={() => setCancelModal(r)} style={S.btnDanger}>✕ Cancelar</button>
+                  </>
+                )}
               </div>
             )},
           ]}
-          rows={rows}
+          rows={enriched}
           emptyMsg="Nenhum fiado registrado."
         />
       </div>
 
+      {/* Modal: Registrar Fiado */}
       {modal && (
         <Modal title="Registrar Fiado" onClose={() => setModal(false)}>
+          {erro && <div style={{ color: C.danger, fontSize: 13, marginBottom: 12, padding: "8px 12px", background: C.dangerBg, borderRadius: 8 }}>{erro}</div>}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-            <Field label="Cliente"><Input value={form.cliente} onChange={e => setForm({ ...form, cliente: e.target.value })} /></Field>
-            <Field label="WhatsApp"><Input value={form.whatsapp} onChange={e => setForm({ ...form, whatsapp: e.target.value })} placeholder="11999990000" /></Field>
-            <div style={{ gridColumn: "1/-1" }}><Field label="Produto"><Input value={form.produto} onChange={e => setForm({ ...form, produto: e.target.value })} /></Field></div>
-            <Field label="Valor (R$)"><Input type="number" value={form.valor} onChange={e => setForm({ ...form, valor: e.target.value })} /></Field>
-            <Field label="Vencimento"><Input type="date" value={form.vencimento} onChange={e => setForm({ ...form, vencimento: e.target.value })} /></Field>
+            {/* Cliente */}
+            <div style={{ gridColumn: "1/-1" }}>
+              <Field label="Cliente *">
+                <input
+                  list="fiado-clientes-list"
+                  value={form.cliente}
+                  onChange={e => {
+                    const nome = e.target.value;
+                    const clienteObj = clientes.find(c => c.nome === nome);
+                    setForm(f => ({ ...f, cliente: nome, whatsapp: clienteObj?.whatsapp || f.whatsapp }));
+                  }}
+                  placeholder="Digite ou selecione o cliente"
+                  style={S.input}
+                />
+                <datalist id="fiado-clientes-list">
+                  {clientes.map(c => <option key={c.id} value={c.nome} />)}
+                </datalist>
+              </Field>
+            </div>
+            <Field label="WhatsApp">
+              <Input value={form.whatsapp} onChange={e => setForm(f => ({ ...f, whatsapp: e.target.value }))} placeholder="11999990000" />
+            </Field>
+            {/* Produto */}
+            <Field label="Produto *">
+              <select value={form.produto_nome} onChange={e => selecionarProduto(e.target.value)} style={S.input}>
+                <option value="">Selecione...</option>
+                {produtoNomes.map(n => <option key={n} value={n}>{n}</option>)}
+              </select>
+            </Field>
+            {/* Tamanho */}
+            {form.produto_nome && (
+              <div style={{ gridColumn: "1/-1" }}>
+                <Field label="Tamanho *">
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    {SIZES.map(s => {
+                      const estq = estoquePorTamanho[s] ?? 0;
+                      const selected = form.tamanho === s;
+                      return (
+                        <button key={s} onClick={() => setForm(f => ({ ...f, tamanho: s }))}
+                          style={{ padding: "8px 14px", borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: estq === 0 ? "not-allowed" : "pointer", opacity: estq === 0 ? 0.35 : 1,
+                            background: selected ? C.yellow : C.surface,
+                            color: selected ? "#000" : estq > 0 ? C.text : C.gray,
+                            border: `2px solid ${selected ? C.yellow : C.border}` }}>
+                          {s}<div style={{ fontSize: 10, fontWeight: 400 }}>{estq}un</div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </Field>
+              </div>
+            )}
+            <Field label="Quantidade">
+              <Input type="number" min={1} value={form.qtd} onChange={e => setForm(f => ({ ...f, qtd: e.target.value }))} />
+            </Field>
+            <Field label="Preço Unit. (R$) *">
+              <Input type="number" step="0.01" value={form.valor_unit} onChange={e => setForm(f => ({ ...f, valor_unit: e.target.value }))} />
+            </Field>
+            <Field label="Data venda">
+              <Input type="date" value={form.data} onChange={e => setForm(f => ({ ...f, data: e.target.value }))} />
+            </Field>
+            <Field label="Vencimento *">
+              <Input type="date" value={form.vencimento} onChange={e => setForm(f => ({ ...f, vencimento: e.target.value }))} />
+            </Field>
+          </div>
+          {/* Preview */}
+          {valorTotal > 0 && (
+            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, padding: "12px 16px", margin: "12px 0", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, fontSize: 12 }}>
+              <div><div style={{ color: C.gray }}>Qtd</div><div style={{ color: C.text, fontWeight: 700 }}>{qtd}x</div></div>
+              <div><div style={{ color: C.gray }}>Preço unit.</div><div style={{ color: C.text, fontWeight: 700 }}>{fmt(valorUnit)}</div></div>
+              <div><div style={{ color: C.gray }}>Total a receber</div><div style={{ color: C.warn, fontWeight: 800, fontSize: 15 }}>{fmt(valorTotal)}</div></div>
+              {estoqueInsuficiente && <div style={{ gridColumn: "1/-1", color: C.danger, fontWeight: 700 }}>⚠ Estoque insuficiente (disponível: {estoqueDisponivel})</div>}
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 10 }}>
+            <Btn onClick={salvar} disabled={saving || estoqueInsuficiente}>{saving ? "Salvando..." : "Salvar Fiado"}</Btn>
+            <Btn ghost onClick={() => setModal(false)}>Cancelar</Btn>
+          </div>
+        </Modal>
+      )}
+
+      {/* Modal: Confirmar cancelamento */}
+      {cancelModal && (
+        <Modal title="Cancelar Fiado" onClose={() => setCancelModal(null)}>
+          <p style={{ color: C.text, marginBottom: 16 }}>
+            Tem certeza que deseja cancelar o fiado de <strong>{cancelModal.cliente}</strong>?
+          </p>
+          <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, padding: "12px 16px", marginBottom: 16, fontSize: 13 }}>
+            <div style={{ color: C.gray, marginBottom: 4 }}>O que vai acontecer:</div>
+            <div style={{ color: C.text }}>• Fiado de {fmt(cancelModal.valor)} será cancelado</div>
+            {cancelModal.nomeProd && <div style={{ color: C.success }}>• {cancelModal.qtd}x {cancelModal.nomeProd} {cancelModal.tamanho} voltam ao estoque</div>}
+            <div style={{ color: C.gray }}>• Conta a receber removida do financeiro</div>
           </div>
           <div style={{ display: "flex", gap: 10 }}>
-            <Btn onClick={salvar} disabled={saving}>{saving ? "Salvando..." : "Salvar"}</Btn>
-            <Btn ghost onClick={() => setModal(false)}>Cancelar</Btn>
+            <button onClick={confirmarCancelamento} style={{ ...S.btn, background: C.danger, color: C.white }}>Confirmar Cancelamento</button>
+            <Btn ghost onClick={() => setCancelModal(null)}>Voltar</Btn>
           </div>
         </Modal>
       )}
@@ -1156,6 +1359,7 @@ function Financeiro() {
   const { rows: manual, loading: loadingFin, add } = useTable("financeiro");
   const { rows: vendas, loading: loadingVendas } = useTable("vendas");
   const { rows: compras, loading: loadingCompras } = useTable("compras");
+  const { rows: fiadoRows, loading: loadingFiado } = useTable("fiado");
   const [modal, setModal] = useState(false);
   const [filtro, setFiltro] = useState("todos");
   const [periodoFiltro, setPeriodoFiltro] = useState("todos");
@@ -1200,6 +1404,19 @@ function Financeiro() {
     origem: "compra",
     origem_id: key,
   }));
+
+  // ── Fiados pagos → entrada automática (não duplicar com lançamento manual do financeiro) ──
+  // Apenas fiados com status "Pago" que NÃO geraram lançamento manual ainda são considerados aqui.
+  // Na prática, marcarPago() já insere em financeiro, então fiados pagos aparecem via manualRows.
+  // Aqui calculamos fiados pendentes/atrasados separadamente para o painel de "A Receber".
+  const todayFinStr = today();
+  const fiadoEnriquecido = fiadoRows.map(f => {
+    const isAtrasado = f.status === "Pendente" && f.vencimento && f.vencimento < todayFinStr;
+    return { ...f, statusReal: isAtrasado ? "Atrasado" : f.status };
+  });
+  const fiadoAReceber = fiadoEnriquecido.filter(f => f.statusReal === "Pendente" || f.statusReal === "Atrasado");
+  const fiadoAtrasados = fiadoEnriquecido.filter(f => f.statusReal === "Atrasado");
+  const totalAReceber = fiadoAReceber.reduce((a, f) => a + Number(f.valor || 0), 0);
 
   // ── Lançamentos manuais ────────────────────────────────────
   const manualRows = manual.map(m => ({ ...m, origem: "manual" }));
@@ -1247,7 +1464,7 @@ function Financeiro() {
     } finally { setSaving(false); }
   };
 
-  if (loadingFin || loadingVendas || loadingCompras) return <Loading />;
+  if (loadingFin || loadingVendas || loadingCompras || loadingFiado) return <Loading />;
 
   return (
     <div>
@@ -1264,6 +1481,40 @@ function Financeiro() {
         <KpiCard label="Lucro Líquido" value={fmt(lucroVendas)} accent={C.yellow} icon="✨" />
         <KpiCard label="Margem" value={`${margem.toFixed(1)}%`} accent={margem >= 30 ? C.success : margem >= 15 ? C.warn : C.danger} icon="📊" />
       </div>
+
+      {/* Painel Contas a Receber (Fiado) */}
+      {fiadoAReceber.length > 0 && (
+        <div style={{ ...S.card, border: `1px solid ${C.warn}44`, marginBottom: 20 }}>
+          <div style={S.sectionTitle}>⏳ Contas a Receber (Fiado)</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12, marginBottom: 16 }}>
+            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 16px" }}>
+              <div style={{ fontSize: 11, color: C.gray, marginBottom: 4 }}>Total a Receber</div>
+              <div style={{ fontSize: 20, fontWeight: 800, color: C.warn }}>{fmt(totalAReceber)}</div>
+            </div>
+            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 16px" }}>
+              <div style={{ fontSize: 11, color: C.gray, marginBottom: 4 }}>Atrasados</div>
+              <div style={{ fontSize: 20, fontWeight: 800, color: C.danger }}>{fiadoAtrasados.length}</div>
+            </div>
+            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 16px" }}>
+              <div style={{ fontSize: 11, color: C.gray, marginBottom: 4 }}>Pendentes</div>
+              <div style={{ fontSize: 20, fontWeight: 800, color: C.warn }}>{fiadoAReceber.length - fiadoAtrasados.length}</div>
+            </div>
+          </div>
+          {fiadoAReceber.slice(0, 5).map(f => (
+            <div key={f.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: `1px solid ${C.border}`, fontSize: 13 }}>
+              <div>
+                <span style={{ color: C.text, fontWeight: 700 }}>{f.cliente}</span>
+                <span style={{ color: C.gray, marginLeft: 8 }}>{f.produto?.split("|")[0] || f.produto}</span>
+              </div>
+              <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                <span style={{ color: f.statusReal === "Atrasado" ? C.danger : C.warn, fontWeight: 700 }}>{fmt(f.valor)}</span>
+                <Badge status={f.statusReal} />
+              </div>
+            </div>
+          ))}
+          {fiadoAReceber.length > 5 && <div style={{ color: C.gray, fontSize: 12, marginTop: 8 }}>+{fiadoAReceber.length - 5} outros — veja em Fiado</div>}
+        </div>
+      )}
 
       {/* Por forma de pagamento */}
       {Object.keys(porPgto).length > 0 && (
